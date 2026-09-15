@@ -48,20 +48,6 @@
 
 各平台严格串行采集。检测到验证码、频率限制、登录墙或未知页面结构时会安全停止，不尝试绕过。
 
-## 项目结构图
-
-<a href="https://Cary222.github.io/all-in/architecture/">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/architecture/allin.dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/architecture/allin.light.png">
-    <img alt="All In 项目结构图：工作台、任务编排、AI、多平台采集、人工确认与浏览器执行。点击打开交互版。" src="docs/architecture/allin.light.png" width="100%">
-  </picture>
-</a>
-
-**[点击打开交互结构图 ↗](https://Cary222.github.io/all-in/architecture/)** · [可编辑源文件](docs/architecture/allin.architecture.json)
-
-交互版支持缩放、节点搜索、关系追踪、深浅主题切换和图片导出。由 [Archify](https://github.com/yuppiez99999/archify-) 生成。
-
 ## 快速开始
 
 需要 Python 3.10+、Node.js 22+、最新版 Google Chrome 和可用的 AI API。第一次使用按以下顺序操作：
