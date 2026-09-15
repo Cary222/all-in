@@ -1,0 +1,157 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --background: 150 10% 96%;
+  --foreground: 154 15% 11%;
+  --card: 0 0% 100%;
+  --card-foreground: 154 15% 11%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 154 15% 11%;
+  --primary: 166 50% 28%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 150 10% 92%;
+  --secondary-foreground: 154 13% 17%;
+  --muted: 150 8% 94%;
+  --muted-foreground: 150 6% 43%;
+  --accent: 164 22% 91%;
+  --accent-foreground: 166 50% 24%;
+  --destructive: 0 47% 49%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 150 9% 87%;
+  --input: 150 8% 81%;
+  --ring: 166 50% 28%;
+  --status-neutral: 150 7% 94%;
+  --status-neutral-foreground: 150 5% 38%;
+  --status-processing: 164 23% 92%;
+  --status-processing-foreground: 164 36% 30%;
+  --status-attention: 44 57% 92%;
+  --status-attention-foreground: 43 65% 29%;
+  --status-success: 143 27% 92%;
+  --status-success-foreground: 146 39% 30%;
+  --status-danger: 0 48% 94%;
+  --status-danger-foreground: 0 43% 43%;
+  --radius: 0.625rem;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html {
+  min-width: 320px;
+  background: hsl(var(--background));
+  scroll-behavior: smooth;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: 'Segoe UI Variable', 'Microsoft YaHei UI', 'PingFang SC', 'Segoe UI', Arial, sans-serif;
+  font-feature-settings: 'kern' 1, 'liga' 1;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+select:not([multiple]) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2369736e' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-position: right 0.75rem center;
+  background-repeat: no-repeat;
+  background-size: 1rem;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: hsl(var(--muted));
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--input));
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.55);
+}
+
+::selection {
+  background: hsl(var(--accent));
+  color: hsl(var(--foreground));
+}
+
+:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+.allin-slider {
+  background: linear-gradient(
+    to right,
+    hsl(var(--primary)) 0,
+    hsl(var(--primary)) var(--slider-progress),
+    hsl(var(--input)) var(--slider-progress),
+    hsl(var(--input)) 100%
+  );
+}
+
+.allin-slider::-webkit-slider-thumb {
+  width: 1rem;
+  height: 1rem;
+  appearance: none;
+  border: 2px solid hsl(var(--card));
+  border-radius: 999px;
+  background: hsl(var(--primary));
+  box-shadow: 0 1px 3px hsl(var(--foreground) / 0.18);
+}
+
+.allin-slider::-moz-range-track {
+  height: 0.5rem;
+  border: 0;
+  border-radius: 999px;
+  background: hsl(var(--input));
+}
+
+.allin-slider::-moz-range-progress {
+  height: 0.5rem;
+  border-radius: 999px;
+  background: hsl(var(--primary));
+}
+
+.allin-slider::-moz-range-thumb {
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 2px solid hsl(var(--card));
+  border-radius: 999px;
+  background: hsl(var(--primary));
+  box-shadow: 0 1px 3px hsl(var(--foreground) / 0.18);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Config with secrets
+config.yaml
+config.yaml.bak-*
+.*.credentials.yaml
+
+# Personal resume
+resume.md
+
+# Data (contains personal info, resumes, DB)
+data/
+!src/allin/data/
+!src/allin/data/boss_cities.json
+*.db
+*.db-shm
+*.db-wal
+
+# Node
+node_modules/
+*.tsbuildinfo
+
+# Frontend build output (built on demand, not tracked in VCS)
+src/allin/web/frontend/dist/
+
+# Local generated artifacts
+output/
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code / local agent notes
+.claude/
+.superpowers/
+docs/superpowers/
+AGENTS.md

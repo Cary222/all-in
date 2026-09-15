@@ -1,0 +1,4062 @@
+import io
+import json
+import tempfile
+import time
+import unittest
+from socketserver import ThreadingMixIn
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import quote
+from unittest.mock import MagicMock, patch
+from wsgiref.simple_server import WSGIServer
+from zipfile import ZipFile
+
+import yaml
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+from allin.db import (
+    add_history,
+    edit_job_greeting,
+    get_db,
+    get_jobs_ready_to_send,
+    get_unresolved_resume_failures,
+    insert_job,
+    save_generated_greeting_preview,
+    mark_existing_greeting_ready,
+    reject_jobs,
+    save_generated_greeting,
+    update_job_greeting,
+    update_job_score,
+    update_job_status,
+)
+from allin.throttle import SendWindowChecker
+from allin.web import server
+from threading import Event, Lock
+
+from allin.scoring_run_store import create_scoring_run, get_scoring_run, update_scoring_run
+from allin.collection_run_store import create_collection_run, update_collection_run
+from allin.web.tasks import TaskAlreadyRunningError, WorkbenchTask, WorkbenchTaskRunner
+
+# datetime.UTC 自 Python 3.11 才提供，而 pyproject.toml 声明支持 >=3.10
+try:
+    from datetime import UTC
+except ImportError:
+    from datetime import timezone as _timezone
+
+    UTC = _timezone.utc
+
+
+def _job(job_id: str) -> dict:
+    return {
+        "id": job_id,
+        "title": "Product Manager",
+        "company": "Example",
+        "salary": "20-30K",
+        "city": "Shanghai",
+        "experience": "1-3 years",
+        "jd": "Build AI product features",
+        "hr_name": "HR",
+        "hr_title": "Recruiter",
+        "hr_active": "",
+        "company_size": "",
+        "company_industry": "",
+        "url": "https://example.com/job",
+    }
+
+
+class WebApiRouteTests(unittest.TestCase):
+    def setUp(self):
+        # Arrange
+        self.original_base_dir = server.BASE_DIR
+
+    def tearDown(self):
+        # Cleanup
+        server.set_base_dir(self.original_base_dir)
+
+    def _request(self, path: str, method: str = "GET", json_body: dict | None = None):
+        if "?" in path:
+            path_info, query_string = path.split("?", 1)
+        else:
+            path_info, query_string = path, ""
+
+        status_headers = {}
+
+        def start_response(status, headers, exc_info=None):
+            status_headers["status"] = status
+            status_headers["headers"] = dict(headers)
+
+        request_body = json.dumps(json_body).encode("utf-8") if json_body is not None else b""
+        environ = {
+            "REQUEST_METHOD": method,
+            "PATH_INFO": path_info,
+            "QUERY_STRING": query_string,
+            "SERVER_NAME": "127.0.0.1",
+            "SERVER_PORT": "8686",
+            "wsgi.version": (1, 0),
+            "wsgi.url_scheme": "http",
+            "wsgi.input": io.BytesIO(request_body),
+            "wsgi.errors": io.StringIO(),
+            "wsgi.multithread": False,
+            "wsgi.multiprocess": False,
+            "wsgi.run_once": False,
+        }
+        if json_body is not None:
+            environ["CONTENT_LENGTH"] = str(len(request_body))
+            environ["CONTENT_TYPE"] = "application/json"
+
+        response_iter = server.app(environ, start_response)
+        try:
+            body = b"".join(
+                chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                for chunk in response_iter
+            ).decode("utf-8")
+        finally:
+            close = getattr(response_iter, "close", None)
+            if close:
+                close()
+        return status_headers["status"], status_headers["headers"], body
+
+    def test_model_list_uses_draft_settings_and_preserves_saved_config(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {}, clear=True):
+            server.set_base_dir(Path(tmp))
+            server._write_config({"ai": {"service": "custom", "provider": "openai_compatible", "base_url": "https://saved.example/v1", "api_key": "saved-secret", "model": "saved-model"}})
+            before = server.CONFIG_PATH.read_bytes()
+            for draft_key, expected_key in [("", "saved-secret"), ("draft-secret", "draft-secret")]:
+                with patch.object(server, "list_ai_models", return_value=["model-a"]) as discover:
+                    status, _, body = self._request("/api/config/models", "POST", {"ai": {"service": "custom", "base_url": "https://draft.example/v1", "api_key": draft_key}})
+                self.assertTrue(status.startswith("200"), body)
+                self.assertEqual(json.loads(body), {"models": ["model-a"]})
+                draft = discover.call_args.args[0]["ai"]
+                self.assertEqual(draft["base_url"], "https://draft.example/v1")
+                self.assertEqual(draft["api_key"], expected_key)
+                self.assertEqual(server.CONFIG_PATH.read_bytes(), before)
+                self.assertEqual(server.load_config(server.CONFIG_PATH)["ai"]["api_key"], "saved-secret")
+            with patch.object(server, "list_ai_models", return_value=[]) as discover:
+                self._request("/api/config/models", "POST", {"ai": {"service": "deepseek", "clear_credentials": True}})
+                self.assertNotIn("api_key", discover.call_args.args[0]["ai"])
+
+    def test_model_list_rejects_bad_input_and_hides_unexpected_errors(self):
+        for payload in ({}, {"ai": []}, {"ai": {"base_url": []}}, {"ai": {"api_key": 123}}):
+            with patch.object(server, "list_ai_models") as discover:
+                status, _, _ = self._request("/api/config/models", "POST", payload)
+                self.assertTrue(status.startswith("400"))
+                discover.assert_not_called()
+        with patch.object(server, "_sanitize_config_for_write", return_value={}), patch.object(server, "list_ai_models", side_effect=RuntimeError("private-secret")):
+            status, _, body = self._request("/api/config/models", "POST", {"ai": {}})
+        self.assertTrue(status.startswith("500"))
+        self.assertNotIn("private-secret", body)
+
+    def _upload_resume(self, filename: str, content: bytes, content_type: str):
+        boundary = "----BossHunterResumeUpload"
+        body = (
+            (
+                f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8")
+            + content
+            + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        )
+        status_headers = {}
+
+        def start_response(status, headers, exc_info=None):
+            status_headers["status"] = status
+            status_headers["headers"] = dict(headers)
+
+        environ = {
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/api/resume/upload",
+            "QUERY_STRING": "",
+            "CONTENT_LENGTH": str(len(body)),
+            "CONTENT_TYPE": f"multipart/form-data; boundary={boundary}",
+            "SERVER_NAME": "127.0.0.1",
+            "SERVER_PORT": "8686",
+            "wsgi.version": (1, 0),
+            "wsgi.url_scheme": "http",
+            "wsgi.input": io.BytesIO(body),
+            "wsgi.errors": io.StringIO(),
+            "wsgi.multithread": False,
+            "wsgi.multiprocess": False,
+            "wsgi.run_once": False,
+        }
+
+        response_body = b"".join(
+            chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+            for chunk in server.app(environ, start_response)
+        ).decode("utf-8")
+        return status_headers["status"], status_headers["headers"], response_body
+
+    @patch.object(server.app, "run")
+    def test_run_server_uses_threaded_wsgi_server(self, run):
+        # Act
+        server.run_server(open_browser=False)
+
+        # Assert
+        server_class = run.call_args.kwargs["server_class"]
+        self.assertTrue(issubclass(server_class, ThreadingMixIn))
+        self.assertTrue(issubclass(server_class, WSGIServer))
+        self.assertTrue(server_class.daemon_threads)
+
+    def test_web_api_missing_api_route_returns_json_404_not_spa_html(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            server.set_base_dir(Path(tmp))
+
+            # Act
+            status, headers, body = self._request("/api/does-not-exist")
+
+        # Assert
+        self.assertTrue(status.startswith("404"))
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual(json.loads(body), {"error": "Not found"})
+        self.assertNotIn("<!doctype html", body.lower())
+
+    def test_web_assets_serve_javascript_with_windows_safe_mime_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            frontend_dir = Path(tmp)
+            assets_dir = frontend_dir / "assets"
+            assets_dir.mkdir()
+            (assets_dir / "app.js").write_text("console.log('ok')\n", encoding="utf-8")
+
+            with patch.object(server, "FRONTEND_DIR", frontend_dir):
+                status, headers, body = self._request("/assets/app.js")
+
+        self.assertTrue(status.startswith("200"))
+        self.assertTrue(headers["Content-Type"].startswith("application/javascript"))
+        self.assertIn("console.log", body)
+
+    def test_web_api_workbench_preflight_full_returns_json_payload(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            resume_path = base_dir / "resume.md"
+            resume_path.write_text("# Resume", encoding="utf-8")
+            (base_dir / "config.yaml").write_text(
+                yaml.dump(
+                    {
+                        "profile": {"resume_path": str(resume_path)},
+                        "search": {"keywords": ["AI产品经理"]},
+                        "ai": {"api_key": "test-api-key"},
+                    },
+                    allow_unicode=True,
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            server.set_base_dir(base_dir)
+
+            # Act
+            ready_checks = [
+                {
+                    "id": "environment",
+                    "title": "运行环境",
+                    "status": "pass",
+                    "message": "启动检查已通过",
+                    "detail": "测试环境已就绪",
+                    "action": "",
+                }
+            ]
+            with patch.object(server, "collect_preflight_checks", return_value=ready_checks):
+                status, headers, body = self._request("/api/workbench/preflight?mode=full")
+
+        # Assert
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual(json.loads(body), {"ok": True, "messages": [], "checks": ready_checks})
+
+    def test_web_api_workbench_preflight_supports_rescore_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            resume_path = base_dir / "resume.md"
+            resume_path.write_text("# Resume", encoding="utf-8")
+            (base_dir / "config.yaml").write_text(
+                yaml.dump(
+                    {
+                        "profile": {"resume_path": str(resume_path)},
+                        "ai": {"api_key": "test-api-key"},
+                    },
+                    allow_unicode=True,
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            server.set_base_dir(base_dir)
+            ready_checks = [
+                {
+                    "id": "ai_credentials",
+                    "title": "AI API",
+                    "status": "pass",
+                    "message": "AI 已连接",
+                    "detail": "",
+                    "action": "",
+                }
+            ]
+
+            with patch.object(server, "collect_preflight_checks", return_value=ready_checks) as collect:
+                status, headers, body = self._request("/api/workbench/preflight?mode=rescore")
+
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertEqual(collect.call_args.args[0], "rescore")
+
+    def test_web_api_workbench_preflight_full_requires_ai_key(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            resume_path = base_dir / "resume.md"
+            resume_path.write_text("# Resume", encoding="utf-8")
+            (base_dir / "config.yaml").write_text(
+                yaml.dump(
+                    {
+                        "profile": {"resume_path": str(resume_path)},
+                        "search": {"keywords": ["AI产品经理"]},
+                    },
+                    allow_unicode=True,
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            server.set_base_dir(base_dir)
+
+            # Act
+            browser_ready = {
+                "node": {"available": True, "version": "v22"},
+                "runtime": True,
+                "chrome": True,
+                "targets": [],
+                "boss_tab": None,
+                "errors": [],
+                "runtime_url": "http://127.0.0.1:3456",
+                "health": {"runtime": "allin"},
+                "browser_product": "Chrome/138.0",
+            }
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("allin.web.preflight.run_browser_diagnostics", return_value=browser_ready),
+            ):
+                status, headers, body = self._request("/api/workbench/preflight?mode=full")
+
+        # Assert
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("application/json", headers["Content-Type"])
+        payload = json.loads(body)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("尚未填写 AI API Key" in message for message in payload["messages"]))
+        self.assertTrue(any(check["id"] == "ai_credentials" for check in payload["checks"]))
+
+    def test_web_api_ai_diagnostics_returns_structured_feedback(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+            checks = [
+                {
+                    "id": "ai_credentials",
+                    "title": "AI API Key",
+                    "status": "error",
+                    "message": "尚未填写 AI API Key",
+                    "detail": "请填写 API Key。",
+                    "action": "config",
+                }
+            ]
+
+            # Act
+            with patch.object(server, "check_ai_connection", return_value=checks):
+                status, headers, body = self._request("/api/diagnostics/ai")
+
+        # Assert
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["checks"], checks)
+        self.assertIn("尚未填写 AI API Key", payload["messages"][0])
+
+    def test_web_api_activity_returns_json_without_runtime_name_error(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            server.set_base_dir(Path(tmp))
+
+            # Act
+            status, headers, body = self._request("/api/activity?days=7")
+
+        # Assert
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual(json.loads(body), [])
+
+    def test_job_search_filters_keyword_score_salary_and_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                matching = _job("matching")
+                matching.update({"title": "实施顾问", "salary": "5-8K", "jd": "负责 SQL 系统实施"})
+                insert_job(db, matching)
+                update_job_score(db, "matching", 82, "数据库技能匹配")
+                update_job_status(db, "matching", "ready")
+
+                wrong_status = _job("wrong-status")
+                wrong_status.update({"title": "实施工程师", "salary": "8-13K", "jd": "需要 SQL"})
+                insert_job(db, wrong_status)
+                update_job_score(db, "wrong-status", 85, "数据库技能匹配")
+                update_job_status(db, "wrong-status", "filtered")
+
+                low_score = _job("low-score")
+                low_score.update({"salary": "10-15K", "jd": "需要 SQL"})
+                insert_job(db, low_score)
+                update_job_score(db, "low-score", 60, "数据库技能匹配")
+                update_job_status(db, "low-score", "ready")
+
+                unrelated = _job("unrelated")
+                unrelated.update({"salary": "10-15K", "jd": "负责客户培训"})
+                insert_job(db, unrelated)
+                update_job_score(db, "unrelated", 88, "沟通能力匹配")
+                update_job_status(db, "unrelated", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, headers, body = self._request(
+                "/api/jobs/search?q=SQL&min_score=71&salary_min=7&salary_max=13&status=ready&limit=15&offset=0"
+            )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual([job["id"] for job in payload["items"]], ["matching"])
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["all_total"], 4)
+        self.assertEqual(payload["limit"], 15)
+        self.assertEqual(payload["offset"], 0)
+
+    def test_job_search_salary_overlap_excludes_unparseable_and_paginates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                fixtures = [
+                    ("high", "12K", 90),
+                    ("middle", "10-15K", 85),
+                    ("low", "5-8K", 80),
+                    ("daily", "150-200元/天", 95),
+                ]
+                for job_id, salary, score in fixtures:
+                    job = _job(job_id)
+                    job["salary"] = salary
+                    insert_job(db, job)
+                    update_job_score(db, job_id, score, "匹配")
+                    update_job_status(db, job_id, "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/search?salary_min=7&salary_max=13&limit=2&offset=1"
+            )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["total"], 3)
+        self.assertEqual([job["id"] for job in payload["items"]], ["middle", "low"])
+
+    def test_job_search_supports_whitelisted_column_sorting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                for job_id, score, education in (("low", 60, "本科"), ("high", 90, "博士")):
+                    job = _job(job_id)
+                    job["education"] = education
+                    insert_job(db, job)
+                    update_job_score(db, job_id, score, "评分")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs/search?sort_by=score&sort_order=asc")
+            invalid_sort_status, _, invalid_sort_body = self._request(
+                "/api/jobs/search?sort_by=score%20DESC&sort_order=asc"
+            )
+            invalid_order_status, _, invalid_order_body = self._request(
+                "/api/jobs/search?sort_by=score&sort_order=sideways"
+            )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual([job["id"] for job in json.loads(body)["items"]], ["low", "high"])
+        self.assertTrue(invalid_sort_status.startswith("400"), invalid_sort_body)
+        self.assertTrue(invalid_order_status.startswith("400"), invalid_order_body)
+
+    def test_job_search_decodes_chinese_keyword_as_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                job = _job("chinese-keyword")
+                job["company"] = "网易"
+                insert_job(db, job)
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(f"/api/jobs/search?q={quote('网易')}")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual([job["id"] for job in payload["items"]], ["chinese-keyword"])
+
+    def test_job_search_orders_newest_jobs_before_higher_scored_older_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("older-high-score"))
+                update_job_score(db, "older-high-score", 95, "高分旧岗位")
+                insert_job(db, _job("newer-low-score"))
+                update_job_score(db, "newer-low-score", 60, "低分新岗位")
+                now = datetime.now(UTC).replace(tzinfo=None)
+                db.execute(
+                    "UPDATE jobs SET created_at = ? WHERE id = ?",
+                    ((now - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"), "older-high-score"),
+                )
+                db.execute(
+                    "UPDATE jobs SET created_at = ? WHERE id = ?",
+                    (now.strftime("%Y-%m-%d %H:%M:%S"), "newer-low-score"),
+                )
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs/search")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(
+            [job["id"] for job in payload["items"]],
+            ["newer-low-score", "older-high-score"],
+        )
+
+    def test_job_search_filters_jobs_by_collection_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                now = datetime.now(UTC).replace(tzinfo=None)
+                fixtures = (
+                    ("today", now),
+                    ("recent", now - timedelta(days=2)),
+                    ("older", now - timedelta(days=8)),
+                )
+                for job_id, created_at in fixtures:
+                    insert_job(db, _job(job_id))
+                    db.execute(
+                        "UPDATE jobs SET created_at = ? WHERE id = ?",
+                        (created_at.strftime("%Y-%m-%d %H:%M:%S"), job_id),
+                    )
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs/search?created_within=3d")
+            today_status, _, today_body = self._request("/api/jobs/search?created_within=today")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual([job["id"] for job in payload["items"]], ["today", "recent"])
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual(payload["all_total"], 3)
+        today_payload = json.loads(today_body)
+        self.assertTrue(today_status.startswith("200"), today_body)
+        self.assertEqual([job["id"] for job in today_payload["items"]], ["today"])
+
+    def test_job_search_rejects_invalid_numeric_ranges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server.set_base_dir(Path(tmp))
+            paths = [
+                "/api/jobs/search?min_score=not-a-number",
+                "/api/jobs/search?salary_min=14&salary_max=7",
+                "/api/jobs/search?limit=0",
+                "/api/jobs/search?created_within=30d",
+            ]
+
+            for path in paths:
+                status, headers, body = self._request(path)
+                self.assertTrue(status.startswith("400"), body)
+                self.assertIn("application/json", headers["Content-Type"])
+                self.assertIn("error", json.loads(body))
+
+    def test_legacy_jobs_endpoint_still_returns_an_array(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("legacy"))
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs?limit=100")
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertIsInstance(json.loads(body), list)
+
+    def test_web_api_workbench_pending_confirmation_returns_ready_jobs(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("ready-job"))
+                update_job_score(db, "ready-job", 82, "good match")
+                update_job_status(db, "ready-job", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            # Act
+            status, headers, body = self._request("/api/workbench")
+
+        # Assert
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual([job["id"] for job in payload["pending_confirmation"]], ["ready-job"])
+
+    def test_workbench_excludes_collection_only_platforms_from_automatic_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                external = _job("zhilian-ready")
+                external.update({"source_platform": "zhilian", "source_job_id": "zhilian-ready"})
+                insert_job(db, external)
+                update_job_score(db, "zhilian-ready", 90, "匹配")
+                update_job_status(db, "zhilian-ready", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "platform_supports", return_value=False):
+                status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["pending_confirmation"], [])
+
+    def test_web_api_workbench_reports_daily_send_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("sent-today"))
+                add_history(db, "sent-today", "sent", "已发送")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["send_quota"], {
+            "daily_limit": 30,
+            "sent": 1,
+            "remaining": 29,
+            "exhausted": False,
+        })
+
+    def test_web_api_workbench_shows_approved_job_when_greeting_was_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("approved-without-greeting"))
+                update_job_score(db, "approved-without-greeting", 84, "good match")
+                update_job_status(db, "approved-without-greeting", "approved")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(
+            [job["id"] for job in payload["pending_confirmation"]],
+            ["approved-without-greeting"],
+        )
+
+    def test_workbench_returns_today_and_cumulative_funnel_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                # Funnel "today" uses the machine's local calendar day. Keep fixtures
+                # in the same clock so this remains stable around local midnight.
+                now = datetime.now()
+                fixtures = (
+                    ("today-ready", "ready", now),
+                    ("today-sent", "sent", now - timedelta(hours=1)),
+                    ("older-sent", "sent", now - timedelta(days=2)),
+                )
+                for job_id, job_status, created_at in fixtures:
+                    insert_job(db, _job(job_id))
+                    update_job_score(db, job_id, 80, "匹配")
+                    update_job_status(db, job_id, job_status)
+                    db.execute(
+                        "UPDATE jobs SET created_at = ? WHERE id = ?",
+                        (created_at.strftime("%Y-%m-%d %H:%M:%S"), job_id),
+                    )
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["funnel"]["采集总数"], 3)
+        self.assertEqual(payload["funnel"]["发送"], 2)
+        self.assertEqual(payload["funnel_today"]["采集总数"], 2)
+        self.assertEqual(payload["funnel_today"]["AI评分"], 2)
+        self.assertEqual(payload["funnel_today"]["发送"], 1)
+        self.assertEqual(len(payload["pending_confirmation"]), 1)
+
+    def test_web_api_full_task_stays_running_while_waiting_for_frontend_confirmation(self):
+        # Arrange
+        confirmation_reached = False
+
+        def fake_collect(task, config):
+            nonlocal confirmation_reached
+            confirmation_reached = True
+
+        runner = WorkbenchTaskRunner()
+        runner._executors["full"] = lambda task, config: server._execute_full(task, config)
+
+        # Act
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("ready-job"))
+                update_job_score(db, "ready-job", 82, "good match")
+                update_job_status(db, "ready-job", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "_execute_collect", side_effect=fake_collect):
+                task = runner.start("full", {})
+                for _ in range(20):
+                    status = runner.status()
+                    active = status["active"]
+                    if active and "等待前端确认投递" in active["logs"]:
+                        break
+                    time.sleep(0.01)
+                time.sleep(0.05)
+                status = runner.status()
+                active = status["active"]
+                if active:
+                    runner._tasks[task["id"]].stop_requested.set()
+                    runner.wait(timeout=1)
+
+        # Assert
+        self.assertTrue(confirmation_reached)
+        self.assertIsNotNone(active)
+        self.assertEqual(active["id"], task["id"])
+        self.assertEqual(active["status"], "running")
+        self.assertIn("等待前端确认投递", active["logs"])
+
+    def test_task_stop_keeps_active_slot_until_executor_really_returns(self):
+        # Arrange
+        started = Event()
+        release = Event()
+
+        def blocking_executor(task, config):
+            started.set()
+            release.wait(timeout=1)
+
+        runner = WorkbenchTaskRunner({
+            "collect": blocking_executor,
+            "monitor": lambda task, config: None,
+        })
+        task = runner.start("collect", {})
+        self.assertTrue(started.wait(timeout=1))
+
+        try:
+            # Act
+            stopped = runner.stop(task["id"])
+            status_after_stop = runner.status()
+            with self.assertRaises(TaskAlreadyRunningError):
+                runner.start("monitor", {})
+            release.set()
+            runner.wait(timeout=1)
+            second_task = runner.start("monitor", {})
+            runner.wait(timeout=1)
+        finally:
+            release.set()
+            runner.wait(timeout=1)
+
+        # Assert
+        self.assertEqual(stopped["status"], "stopping")
+        self.assertEqual(status_after_stop["active"]["id"], task["id"])
+        self.assertEqual(status_after_stop["active"]["status"], "stopping")
+        self.assertEqual(second_task["mode"], "monitor")
+
+    def test_task_stop_wakes_monitor_interval_wait(self):
+        # Arrange
+        waiting = Event()
+        release = Event()
+
+        def monitor_executor(task, config):
+            task.context["monitor_wakeup_event"] = release
+            waiting.set()
+            release.wait(timeout=1)
+
+        runner = WorkbenchTaskRunner({"monitor": monitor_executor})
+        task = runner.start("monitor", {})
+        self.assertTrue(waiting.wait(timeout=1))
+
+        # Act
+        runner.stop(task["id"])
+        runner.wait(timeout=0.5)
+        result = runner.status()["last_task"]
+
+        # Assert
+        self.assertTrue(release.is_set())
+        self.assertEqual(result["status"], "stopped")
+        self.assertIsNone(runner.status()["active"])
+
+    def test_task_runner_automatically_stops_at_send_window_deadline(self):
+        # Arrange
+        def wait_for_stop(task, config):
+            task.stop_requested.wait(timeout=1)
+
+        runner = WorkbenchTaskRunner({"monitor": wait_for_stop})
+        deadline = datetime.now() + timedelta(milliseconds=50)
+
+        # Act
+        with patch("allin.web.tasks._deadline_from_config", return_value=deadline):
+            task = runner.start("monitor", {"throttle": {"send_windows": ["09:00-16:00"]}})
+            runner.wait(timeout=1)
+        result = runner.status()["last_task"]
+
+        # Assert
+        self.assertEqual(task["deadline_at"], deadline.isoformat(timespec="seconds"))
+        self.assertEqual(result["status"], "stopped")
+        self.assertTrue(result["stop_requested"])
+        self.assertEqual(result["stop_reason"], "已到发送时间窗口截止时间，后台自动停止")
+        self.assertIn(result["stop_reason"], result["logs"])
+
+    def test_task_runner_does_not_start_after_today_deadline(self):
+        # Arrange
+        executed = Event()
+        runner = WorkbenchTaskRunner({"monitor": lambda task, config: executed.set()})
+        deadline = datetime.now() - timedelta(minutes=1)
+
+        # Act
+        with patch("allin.web.tasks._deadline_from_config", return_value=deadline):
+            task = runner.start("monitor", {"throttle": {"send_windows": ["09:00-16:00"]}})
+
+        # Assert
+        self.assertEqual(task["status"], "stopped")
+        self.assertEqual(task["stop_reason"], "今日发送时间窗口已截止，后台未启动")
+        self.assertFalse(executed.is_set())
+        self.assertIsNone(runner.status()["active"])
+
+    def test_send_window_checker_uses_last_window_end_as_daily_deadline(self):
+        checker = SendWindowChecker(["09:00-12:00", "14:00-17:30", "99:00-100:00"])
+
+        deadline = checker.latest_end_datetime(datetime(2026, 7, 28, 10, 15, 45))
+
+        self.assertEqual(deadline, datetime(2026, 7, 28, 17, 30))
+
+    def test_web_api_full_task_completes_when_no_jobs_need_confirmation(self):
+        # Arrange
+        calls = []
+
+        def fake_collect(task, config):
+            calls.append("collect")
+
+        runner = WorkbenchTaskRunner()
+        runner._executors["full"] = lambda task, config: server._execute_full(task, config)
+
+        # Act
+        with tempfile.TemporaryDirectory() as tmp:
+            server.set_base_dir(Path(tmp))
+            with patch.object(server, "_execute_collect", side_effect=fake_collect):
+                task = runner.start("full", {})
+                runner.wait(timeout=1)
+                status = runner.status()
+                last_task = status["last_task"]
+
+        # Assert
+        self.assertEqual(calls, ["collect"])
+        self.assertIsNone(status["active"])
+        self.assertEqual(last_task["id"], task["id"])
+        self.assertEqual(last_task["status"], "completed")
+        self.assertIn("没有待确认岗位，流程结束", last_task["logs"])
+
+    def test_web_api_deliver_hands_selected_jobs_to_waiting_full_task(self):
+        # Arrange
+        confirmation_event = Event()
+        full_task = WorkbenchTask(id="full-task", mode="full", label="运行全流程")
+        full_task.context["waiting_confirmation"] = True
+        full_task.context["confirmation_event"] = confirmation_event
+        runner = WorkbenchTaskRunner()
+        runner._tasks[full_task.id] = full_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("ready-job"))
+                update_job_status(db, "ready-job", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            body = json.dumps({"job_ids": ["ready-job"]}).encode("utf-8")
+            status_headers = {}
+
+            def start_response(status, headers, exc_info=None):
+                status_headers["status"] = status
+                status_headers["headers"] = dict(headers)
+
+            environ = {
+                "REQUEST_METHOD": "POST",
+                "PATH_INFO": "/api/workbench/deliver",
+                "QUERY_STRING": "",
+                "CONTENT_LENGTH": str(len(body)),
+                "CONTENT_TYPE": "application/json",
+                "SERVER_NAME": "127.0.0.1",
+                "SERVER_PORT": "8686",
+                "wsgi.version": (1, 0),
+                "wsgi.url_scheme": "http",
+                "wsgi.input": io.BytesIO(body),
+                "wsgi.errors": io.StringIO(),
+                "wsgi.multithread": False,
+                "wsgi.multiprocess": False,
+                "wsgi.run_once": False,
+            }
+
+            # Act
+            with patch.object(server, "task_runner", runner):
+                response_body = b"".join(
+                    chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                    for chunk in server.app(environ, start_response)
+                ).decode("utf-8")
+
+        # Assert
+        self.assertTrue(status_headers["status"].startswith("200"), response_body)
+        self.assertTrue(confirmation_event.is_set())
+        self.assertEqual(full_task.context["confirmed_job_ids"], ["ready-job"])
+        self.assertEqual(json.loads(response_body)["id"], "full-task")
+
+    def test_web_api_deliver_batch_continues_send_when_some_greetings_fail(self):
+        task = WorkbenchTask(id="deliver-partial", mode="full", label="运行全流程")
+        config = {
+            "_workbench_job_ids": ["job-1", "job-2"],
+            "_workbench_send_report": {
+                "requested_count": 1,
+                "sent_count": 1,
+                "failed_count": 0,
+                "deferred_count": 0,
+                "quota_deferred_count": 0,
+                "already_sent": 0,
+                "daily_limit": 0,
+                "remaining_quota": 0,
+            },
+        }
+        logs: list[str] = []
+        task.logs = logs
+
+        with (
+            patch("allin.ai.greeter.generate_greetings", return_value=1) as generate,
+            patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"),
+            patch("allin.executor.sender.send_greetings", return_value=1) as send,
+        ):
+            server._execute_deliver_batch(task, config)
+
+        generate.assert_called_once()
+        send.assert_called_once()
+        self.assertTrue(any("未生成招呼语" in message and "手动填写" in message for message in logs))
+        self.assertTrue(any("继续进入发送流程" in message for message in logs))
+        self.assertEqual(task.metrics.get("send_success"), 1)
+
+    def test_web_api_manual_sent_records_external_send_without_using_boss_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                external = _job("51job-manual")
+                external.update({"source_platform": "51job", "source_job_id": "51job-manual"})
+                insert_job(db, external)
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/manual-sent",
+                method="POST",
+                json_body={"job_ids": ["51job-manual"], "confirmed": True},
+            )
+            workbench_status, _, workbench_body = self._request("/api/workbench")
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                row = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?",
+                    ("51job-manual",),
+                ).fetchone()
+                history = verify_db.execute(
+                    "SELECT action FROM history WHERE job_id = ?",
+                    ("51job-manual",),
+                ).fetchall()
+            finally:
+                verify_db.close()
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(json.loads(body)["affected_count"], 1)
+        self.assertTrue(workbench_status.startswith("200"), workbench_body)
+        self.assertEqual(json.loads(workbench_body)["send_quota"]["sent"], 0)
+        self.assertEqual(row["status"], "sent")
+        self.assertEqual([item["action"] for item in history], ["manual_sent"])
+
+    def test_web_api_cities_returns_bundled_liepin_snapshot(self):
+        status, _, body = self._request("/api/cities?platform=liepin")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["count"], len(payload["cities"]))
+        self.assertIn({"name": "北京", "code": "010"}, payload["cities"])
+
+    def test_web_api_city_refresh_rejects_liepin_bundled_catalog(self):
+        status, _, body = self._request("/api/cities/refresh?platform=liepin", method="POST")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertFalse(payload["ok"])
+        self.assertIn("猎聘", payload["error"])
+
+    def test_web_api_deliver_rejects_already_sent_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("already-sent"))
+                update_job_greeting(db, "already-sent", "已经发送过的招呼语")
+                update_job_status(db, "already-sent", "sent")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/workbench/deliver",
+                method="POST",
+                json_body={"job_ids": ["already-sent"]},
+            )
+
+        self.assertTrue(status.startswith("409"), body)
+        payload = json.loads(body)
+        self.assertEqual(payload["error"], "所选岗位已经投递，不能重复发送")
+        self.assertEqual(payload["invalid_ids"], ["already-sent"])
+        self.assertEqual(payload["already_sent_ids"], ["already-sent"])
+        self.assertEqual(payload["not_ready_ids"], [])
+
+    def test_web_api_deliver_reports_pending_jobs_as_not_ready_instead_of_already_sent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("pending-without-history"))
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/workbench/deliver",
+                method="POST",
+                json_body={"job_ids": ["pending-without-history"]},
+            )
+
+        self.assertTrue(status.startswith("409"), body)
+        payload = json.loads(body)
+        self.assertEqual(payload["error"], "所选岗位尚未完成评分筛选或人工确认，暂不能投递")
+        self.assertEqual(payload["invalid_ids"], ["pending-without-history"])
+        self.assertEqual(payload["already_sent_ids"], [])
+        self.assertEqual(payload["not_ready_ids"], ["pending-without-history"])
+
+    def test_web_api_direct_send_requires_a_retryable_greeting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("error-without-greeting"))
+                update_job_status(db, "error-without-greeting", "error")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/workbench/deliver",
+                method="POST",
+                json_body={"job_ids": ["error-without-greeting"], "direct_send": True},
+            )
+
+        self.assertTrue(status.startswith("409"), body)
+        payload = json.loads(body)
+        self.assertEqual(payload["error"], "所选岗位尚未生成招呼语，不能直接发送")
+        self.assertEqual(payload["invalid_ids"], ["error-without-greeting"])
+        self.assertEqual(payload["missing_greeting_ids"], ["error-without-greeting"])
+
+    def test_web_api_direct_send_retries_liepin_error_job_with_existing_greeting(self):
+        runner = WorkbenchTaskRunner()
+        received_config = {}
+
+        def capture_deliver(_task, config):
+            received_config.update(config)
+
+        runner._executors["deliver"] = capture_deliver
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                job = _job("liepin-retry")
+                job.update({
+                    "source_platform": "liepin",
+                    "source_job_id": "liepin-retry",
+                    "url": "https://www.liepin.com/job/1956208847.shtml",
+                })
+                insert_job(db, job)
+                update_job_greeting(db, "liepin-retry", "已生成的猎聘招呼语")
+                update_job_status(db, "liepin-retry", "error")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner), \
+                 patch.object(
+                     server,
+                     "_task_config",
+                     side_effect=lambda overrides=None: dict(overrides or {}),
+                 ), \
+                 patch("allin.web.tasks._deadline_from_config", return_value=None):
+                status, _, body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={"job_ids": ["liepin-retry"], "direct_send": True},
+                )
+                runner.wait(timeout=1)
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(received_config["_workbench_job_ids"], ["liepin-retry"])
+        self.assertEqual(received_config["_platform"], "liepin")
+        self.assertTrue(received_config["_workbench_skip_greeting"])
+
+    def test_web_api_direct_send_never_regenerates_finalized_greeting(self):
+        runner = WorkbenchTaskRunner()
+        received_config = {}
+
+        def capture_deliver(_task, config):
+            received_config.update(config)
+
+        runner._executors["deliver"] = capture_deliver
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("direct-finalized"))
+                update_job_greeting(db, "direct-finalized", "已经确认的招呼语")
+                update_job_status(db, "direct-finalized", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner), \
+                 patch.object(
+                     server,
+                     "_task_config",
+                     side_effect=lambda overrides=None: dict(overrides or {}),
+                 ), \
+                 patch("allin.web.tasks._deadline_from_config", return_value=None):
+                status, _, body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={"job_ids": ["direct-finalized"], "direct_send": True},
+                )
+                runner.wait(timeout=1)
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(received_config["_workbench_job_ids"], ["direct-finalized"])
+        self.assertTrue(received_config["_workbench_skip_greeting"])
+
+    def test_pending_greeting_preview_requires_selection_before_send(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("preview-pending"))
+                update_job_status(db, "preview-pending", "ready")
+                saved = save_generated_greeting_preview(
+                    db,
+                    "preview-pending",
+                    original="原始招呼语",
+                    optimized="优化后的招呼语",
+                    style_issues=["开头与近期消息重复"],
+                    selected_greeting="原始招呼语",
+                    selection="pending",
+                )
+                self.assertTrue(saved)
+                self.assertEqual(get_jobs_ready_to_send(db), [])
+                self.assertEqual(
+                    [job["id"] for job in get_jobs_ready_to_send(db, include_pending_review=True)],
+                    ["preview-pending"],
+                )
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            workbench_status, _, workbench_body = self._request("/api/workbench")
+            send_status, _, send_body = self._request(
+                "/api/workbench/deliver",
+                method="POST",
+                json_body={"job_ids": ["preview-pending"], "direct_send": True},
+            )
+
+        self.assertTrue(workbench_status.startswith("200"), workbench_body)
+        preview = json.loads(workbench_body)["pending_greetings"][0]
+        self.assertEqual(preview["greeting_original"], "原始招呼语")
+        self.assertEqual(preview["greeting_optimized"], "优化后的招呼语")
+        self.assertEqual(preview["greeting_style_issues"], ["开头与近期消息重复"])
+        self.assertTrue(send_status.startswith("409"), send_body)
+        self.assertEqual(json.loads(send_body)["code"], "greeting_review_required")
+
+    def test_greeting_selection_applies_choice_and_locks_the_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("preview-choice"))
+                update_job_status(db, "preview-choice", "ready")
+                save_generated_greeting_preview(
+                    db,
+                    "preview-choice",
+                    original="原始招呼语",
+                    optimized="优化后的招呼语",
+                    style_issues=["表达可以更简洁"],
+                    selected_greeting="原始招呼语",
+                    selection="pending",
+                )
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            unconfirmed_status, _, unconfirmed_body = self._request(
+                "/api/jobs/preview-choice/greeting-selection",
+                method="POST",
+                json_body={"selection": "optimized"},
+            )
+            status, _, body = self._request(
+                "/api/jobs/preview-choice/greeting-selection",
+                method="POST",
+                json_body={"selection": "optimized", "confirmed": True},
+            )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                row = verify_db.execute(
+                    "SELECT greeting, greeting_selection, greeting_reviewed_at FROM jobs WHERE id = ?",
+                    ("preview-choice",),
+                ).fetchone()
+                history = verify_db.execute(
+                    "SELECT action, detail FROM history WHERE job_id = ? ORDER BY id",
+                    ("preview-choice",),
+                ).fetchall()
+                overwritten = save_generated_greeting_preview(
+                    verify_db,
+                    "preview-choice",
+                    original="新原文",
+                    optimized="新优化版",
+                    style_issues=[],
+                    selected_greeting="新优化版",
+                    selection="auto_optimized",
+                )
+            finally:
+                verify_db.close()
+
+        self.assertTrue(unconfirmed_status.startswith("409"), unconfirmed_body)
+        self.assertIn("confirmed=true", json.loads(unconfirmed_body)["error"])
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(json.loads(body)["greeting"], "优化后的招呼语")
+        self.assertEqual(row["greeting"], "优化后的招呼语")
+        self.assertEqual(row["greeting_selection"], "optimized")
+        self.assertIsNotNone(row["greeting_reviewed_at"])
+        self.assertEqual([(item["action"], item["detail"]) for item in history], [
+            ("greeting_selected", "采用优化招呼语"),
+        ])
+        self.assertFalse(overwritten)
+
+    def test_web_api_deliver_queues_confirmation_before_full_task_event_exists(self):
+        full_task = WorkbenchTask(id="full-before-event", mode="full", label="运行全流程")
+        runner = WorkbenchTaskRunner()
+        runner._tasks[full_task.id] = full_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("ready-job"))
+                update_job_status(db, "ready-job", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={"job_ids": ["ready-job"]},
+                )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                job_status = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?",
+                    ("ready-job",),
+                ).fetchone()["status"]
+            finally:
+                verify_db.close()
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(json.loads(body)["id"], "full-before-event")
+        self.assertEqual(full_task.context["confirmed_job_ids"], ["ready-job"])
+        self.assertTrue(full_task.context["delivery_requested"])
+        self.assertEqual(job_status, "approved")
+
+    def test_web_api_deliver_queues_jobs_while_full_task_is_monitoring(self):
+        # Arrange
+        wakeup_event = Event()
+        full_task = WorkbenchTask(id="full-monitoring", mode="full", label="运行全流程")
+        full_task.context.update({
+            "monitoring": True,
+            "monitor_queue_lock": Lock(),
+            "monitor_wakeup_event": wakeup_event,
+            "pending_deliveries": [],
+        })
+        runner = WorkbenchTaskRunner()
+        runner._tasks[full_task.id] = full_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("ready-job"))
+                update_job_status(db, "ready-job", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            body = json.dumps({"job_ids": ["ready-job"]}).encode("utf-8")
+            status_headers = {}
+
+            def start_response(status, headers, exc_info=None):
+                status_headers["status"] = status
+                status_headers["headers"] = dict(headers)
+
+            environ = {
+                "REQUEST_METHOD": "POST",
+                "PATH_INFO": "/api/workbench/deliver",
+                "QUERY_STRING": "",
+                "CONTENT_LENGTH": str(len(body)),
+                "CONTENT_TYPE": "application/json",
+                "SERVER_NAME": "127.0.0.1",
+                "SERVER_PORT": "8686",
+                "wsgi.version": (1, 0),
+                "wsgi.url_scheme": "http",
+                "wsgi.input": io.BytesIO(body),
+                "wsgi.errors": io.StringIO(),
+                "wsgi.multithread": False,
+                "wsgi.multiprocess": False,
+                "wsgi.run_once": False,
+            }
+
+            # Act
+            with patch.object(server, "task_runner", runner):
+                response_body = b"".join(
+                    chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                    for chunk in server.app(environ, start_response)
+                ).decode("utf-8")
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                status = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?",
+                    ("ready-job",),
+                ).fetchone()["status"]
+            finally:
+                verify_db.close()
+
+        # Assert
+        self.assertTrue(status_headers["status"].startswith("200"), response_body)
+        self.assertEqual(json.loads(response_body)["id"], "full-monitoring")
+        self.assertEqual(status, "approved")
+        self.assertTrue(wakeup_event.is_set())
+        self.assertEqual(
+            full_task.context["pending_deliveries"],
+            [{"job_ids": ["ready-job"], "direct_send": False}],
+        )
+
+    def test_web_api_deliver_reuses_active_delivery_queue_instead_of_conflict(self):
+        active_task = WorkbenchTask(id="active-delivery", mode="deliver", label="确认投递")
+        active_task.context.update({
+            "delivering": True,
+            "delivery_queue_lock": Lock(),
+            "delivery_scheduled_ids": {"already-scheduled"},
+            "pending_deliveries": [],
+        })
+        runner = WorkbenchTaskRunner()
+        runner._tasks[active_task.id] = active_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                for job_id in ("already-scheduled", "new-ready"):
+                    insert_job(db, _job(job_id))
+                    update_job_status(db, job_id, "ready")
+                    update_job_greeting(db, job_id, f"{job_id} 的待发送招呼语")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={"job_ids": ["already-scheduled", "new-ready"], "direct_send": True},
+                )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["id"], "active-delivery")
+        self.assertEqual(payload["queued_count"], 1)
+        self.assertEqual(payload["already_queued_count"], 1)
+        self.assertEqual(
+            active_task.context["pending_deliveries"],
+            [{"job_ids": ["new-ready"], "direct_send": True, "platform": "boss"}],
+        )
+
+    def test_execute_deliver_drains_batches_added_to_active_queue(self):
+        task = WorkbenchTask(id="delivery-task", mode="deliver", label="确认投递")
+        task.context["pending_deliveries"] = [
+            {"job_ids": ["queued-job"], "direct_send": True}
+        ]
+        config = {"_workbench_job_ids": ["initial-job"], "throttle": {}}
+
+        with patch.object(server, "_execute_deliver_batch") as execute_batch:
+            server._execute_deliver(task, config)
+
+        self.assertEqual(execute_batch.call_count, 2)
+        self.assertEqual(execute_batch.call_args_list[0].args[1]["_workbench_job_ids"], ["initial-job"])
+        self.assertEqual(execute_batch.call_args_list[1].args[1]["_workbench_job_ids"], ["queued-job"])
+        self.assertTrue(execute_batch.call_args_list[1].args[1]["_workbench_skip_greeting"])
+
+    def test_monitor_loop_processes_queued_delivery_before_next_check(self):
+        # Arrange
+        task = WorkbenchTask(id="monitoring-task", mode="full", label="运行全流程")
+        task.context.update({
+            "monitor_queue_lock": Lock(),
+            "monitor_wakeup_event": Event(),
+            "pending_deliveries": [
+                {"job_ids": ["approved-a", "approved-b"], "direct_send": False}
+            ],
+        })
+
+        def stop_after_monitor(_config):
+            task.stop_requested.set()
+
+        # Act
+        with patch.object(server, "_execute_deliver") as execute_deliver, \
+             patch(
+                 "allin.executor.monitor.monitor_and_send_resumes",
+                 side_effect=stop_after_monitor,
+             ):
+            server._execute_monitor(task, {"monitor": {"interval": 30}})
+
+        # Assert
+        execute_deliver.assert_called_once()
+        deliver_config = execute_deliver.call_args.args[1]
+        self.assertEqual(
+            deliver_config["_workbench_job_ids"],
+            ["approved-a", "approved-b"],
+        )
+
+    def test_web_api_deliver_ignores_stale_stopped_full_task_waiting_context(self):
+        # Arrange
+        stale_event = Event()
+        stale_task = WorkbenchTask(id="stale-full-task", mode="full", label="运行全流程", status="stopped")
+        stale_task.context["waiting_confirmation"] = True
+        stale_task.context["confirmation_event"] = stale_event
+
+        active_event = Event()
+        active_task = WorkbenchTask(id="active-full-task", mode="full", label="运行全流程")
+        active_task.context["waiting_confirmation"] = True
+        active_task.context["confirmation_event"] = active_event
+
+        runner = WorkbenchTaskRunner()
+        runner._tasks[stale_task.id] = stale_task
+        runner._tasks[active_task.id] = active_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("ready-job"))
+                update_job_status(db, "ready-job", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            body = json.dumps({"job_ids": ["ready-job"]}).encode("utf-8")
+            status_headers = {}
+
+            def start_response(status, headers, exc_info=None):
+                status_headers["status"] = status
+                status_headers["headers"] = dict(headers)
+
+            environ = {
+                "REQUEST_METHOD": "POST",
+                "PATH_INFO": "/api/workbench/deliver",
+                "QUERY_STRING": "",
+                "CONTENT_LENGTH": str(len(body)),
+                "CONTENT_TYPE": "application/json",
+                "SERVER_NAME": "127.0.0.1",
+                "SERVER_PORT": "8686",
+                "wsgi.version": (1, 0),
+                "wsgi.url_scheme": "http",
+                "wsgi.input": io.BytesIO(body),
+                "wsgi.errors": io.StringIO(),
+                "wsgi.multithread": False,
+                "wsgi.multiprocess": False,
+                "wsgi.run_once": False,
+            }
+
+            # Act
+            with patch.object(server, "task_runner", runner):
+                response_body = b"".join(
+                    chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                    for chunk in server.app(environ, start_response)
+                ).decode("utf-8")
+
+        # Assert
+        self.assertTrue(status_headers["status"].startswith("200"), response_body)
+        self.assertFalse(stale_event.is_set())
+        self.assertTrue(active_event.is_set())
+        self.assertNotIn("confirmed_job_ids", stale_task.context)
+        self.assertEqual(active_task.context["confirmed_job_ids"], ["ready-job"])
+        self.assertEqual(json.loads(response_body)["id"], "active-full-task")
+
+    def test_web_api_deliver_conflict_does_not_change_job_or_history(self):
+        active_task = WorkbenchTask(id="active-delivery", mode="deliver", label="确认投递")
+        runner = WorkbenchTaskRunner()
+        runner._tasks[active_task.id] = active_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("ready-job"))
+                update_job_status(db, "ready-job", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner):
+                response_status, _, response_body = self._request(
+                    "/api/workbench/deliver",
+                    method="POST",
+                    json_body={"job_ids": ["ready-job"]},
+                )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                job_status = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?",
+                    ("ready-job",),
+                ).fetchone()["status"]
+                approved_history = verify_db.execute(
+                    "SELECT COUNT(*) FROM history WHERE job_id = ? AND action = ?",
+                    ("ready-job", "approved"),
+                ).fetchone()[0]
+            finally:
+                verify_db.close()
+
+        self.assertTrue(response_status.startswith("409"), response_body)
+        self.assertEqual(job_status, "ready")
+        self.assertEqual(approved_history, 0)
+
+    def test_web_api_full_task_continues_delivery_and_monitoring_after_confirmation(self):
+        # Arrange
+        calls = []
+
+        def fake_collect(task, config):
+            calls.append("collect")
+
+        def fake_deliver(task, config):
+            calls.append((
+                "deliver",
+                config.get("_workbench_job_ids"),
+                config.get("throttle", {}).get("daily_limit"),
+            ))
+
+        def fake_monitor(task, config, **kwargs):
+            calls.append("monitor")
+
+        runner = WorkbenchTaskRunner()
+        runner._executors["full"] = lambda task, config: server._execute_full(task, config)
+
+        # Act
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("ready-a"))
+                update_job_score(db, "ready-a", 88, "good match")
+                update_job_status(db, "ready-a", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "_execute_collect", side_effect=fake_collect), \
+                 patch.object(server, "_execute_deliver", side_effect=fake_deliver), \
+                 patch.object(server, "_execute_monitor", side_effect=fake_monitor), \
+                 patch.object(server, "load_config", return_value={"throttle": {"daily_limit": 40}}):
+                task = runner.start("full", {})
+                for _ in range(50):
+                    running_task = runner._tasks[task["id"]]
+                    confirmation_event = running_task.context.get("confirmation_event")
+                    if isinstance(confirmation_event, Event):
+                        running_task.context["confirmed_job_ids"] = ["ready-a", "ready-b"]
+                        confirmation_event.set()
+                        break
+                    time.sleep(0.01)
+                runner.wait(timeout=1)
+
+        # Assert
+        self.assertEqual(
+            calls,
+            ["collect", ("deliver", ["ready-a", "ready-b"], 40), "monitor"],
+        )
+
+    def test_full_task_consumes_confirmation_queued_before_event_creation(self):
+        calls = []
+        task = WorkbenchTask(id="queued-before-event", mode="full", label="运行全流程")
+        task.context.update({
+            "confirmed_job_ids": ["approved-a"],
+            "delivery_requested": True,
+        })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("approved-a"))
+                update_job_score(db, "approved-a", 88, "good match")
+                update_job_status(db, "approved-a", "approved")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "_execute_collect", side_effect=lambda *_: calls.append("collect")), \
+                 patch.object(
+                     server,
+                     "_execute_deliver",
+                     side_effect=lambda _task, config: calls.append(("deliver", config["_workbench_job_ids"])),
+                 ), \
+                 patch.object(server, "_execute_monitor", side_effect=lambda *_, **__: calls.append("monitor")), \
+                 patch.object(server, "load_config", return_value={}):
+                server._execute_full(task, {})
+
+        self.assertEqual(calls, ["collect", ("deliver", ["approved-a"]), "monitor"])
+        self.assertFalse(task.context["waiting_confirmation"])
+        self.assertTrue(task.context["confirmation_complete"])
+
+    def test_full_task_skips_backlog_without_confirmation(self):
+        # Codex 审计 P1 后的新契约：ready 积压代表"生成过草稿"而非"确认过投递"，
+        # 没有待确认岗位时全流程不得自动发送积压，只提示走「直接发送」人工路径。
+        # Arrange
+        calls = []
+        task = WorkbenchTask(id="backlog-first", mode="full", label="运行全流程")
+
+        def fake_deliver(_task, deliver_config):
+            calls.append((
+                "deliver",
+                deliver_config.get("_workbench_job_ids"),
+                deliver_config.get("_workbench_skip_greeting"),
+                deliver_config.get("throttle", {}).get("daily_limit"),
+            ))
+
+        def fake_collect(_task, _config):
+            calls.append("collect")
+
+        # Act
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("deferred-ready"))
+                update_job_status(db, "deferred-ready", "ready")
+                update_job_greeting(db, "deferred-ready", "您好，我对这个岗位很感兴趣。")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "_execute_deliver", side_effect=fake_deliver), \
+                 patch.object(server, "_execute_collect", side_effect=fake_collect), \
+                 patch.object(server, "load_config", return_value={"throttle": {"daily_limit": 40}}):
+                server._execute_full(task, {})
+
+        # Assert
+        self.assertEqual(calls, ["collect"])
+        self.assertTrue(any("未经人工确认不会自动发送" in message for message in task.logs))
+
+    def test_deliver_keeps_partial_result_and_continues_after_single_failure(self):
+        # Arrange
+        task = WorkbenchTask(id="partial-delivery", mode="full", label="运行全流程")
+        config = {"_workbench_job_ids": ["job-a", "job-b", "job-c"]}
+
+        def fake_send(send_config, force=False, db_path=None):
+            send_config["_workbench_send_report"] = {
+                "sent_count": 1,
+                "failed_count": 1,
+                "deferred_count": 1,
+                "quota_deferred_count": 1,
+                "stop_reason": "daily_limit",
+            }
+            return 1
+
+        # Act: a partial result must not raise and abort the full workflow.
+        with patch("allin.ai.greeter.generate_greetings", return_value=3), \
+        patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+             patch("allin.executor.sender.send_greetings", side_effect=fake_send):
+            server._execute_deliver(task, config)
+
+        # Assert
+        self.assertIn("招呼语发送结果：成功 1，失败 1，待下次发送 1（共 3）", task.logs)
+        self.assertIn("1 个岗位发送失败已单独记录，继续后续流程", task.logs)
+        self.assertIn("1 个岗位因今日发送额度未执行，已保留在“待发送招呼语”", task.logs)
+        self.assertEqual(task.stop_reason, "daily_limit")
+        self.assertEqual(task.metrics["send_success"], 1)
+        self.assertEqual(task.metrics["send_deferred"], 1)
+
+    def test_deliver_counts_preserved_greetings_as_ready(self):
+        task = WorkbenchTask(id="preserved-greeting", mode="deliver", label="投递")
+        config = {"_workbench_job_ids": ["job-a", "job-b", "job-c"]}
+
+        def fake_generate(greeting_config, job_ids=None, db_path=None):
+            greeting_config["_workbench_greeting_report"] = {"skipped_existing": 1}
+            return 1
+
+        def fake_send(send_config, force=False, db_path=None):
+            send_config["_workbench_send_report"] = {"sent_count": 2}
+            return 2
+
+        with patch("allin.ai.greeter.generate_greetings", side_effect=fake_generate), \
+        patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+             patch("allin.executor.sender.send_greetings", side_effect=fake_send):
+            server._execute_deliver(task, config)
+
+        self.assertIn("招呼语准备完成：2/3（新生成 1）", task.logs)
+        self.assertTrue(any("1 个岗位未生成招呼语" in message for message in task.logs))
+        self.assertFalse(any("2 个岗位未生成招呼语" in message for message in task.logs))
+
+    def test_deliver_still_stops_on_account_risk_signal(self):
+        # Arrange
+        task = WorkbenchTask(id="risk-delivery", mode="full", label="运行全流程")
+        config = {"_workbench_job_ids": ["job-a", "job-b"]}
+
+        def fake_send(send_config, force=False, db_path=None):
+            send_config["_workbench_send_report"] = {
+                "sent_count": 0,
+                "failed_count": 1,
+                "deferred_count": 1,
+                "quota_deferred_count": 0,
+                "stop_reason": "captcha",
+            }
+            return 0
+
+        # Act / Assert
+        with patch("allin.ai.greeter.generate_greetings", return_value=2), \
+        patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+             patch("allin.executor.sender.send_greetings", side_effect=fake_send), \
+             self.assertRaisesRegex(RuntimeError, "验证码"):
+            server._execute_deliver(task, config)
+
+    def test_web_api_workbench_reject_marks_selected_ready_jobs_rejected(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("reject-a"))
+                update_job_score(db, "reject-a", 82, "good match")
+                update_job_status(db, "reject-a", "ready")
+
+                insert_job(db, _job("reject-b"))
+                update_job_score(db, "reject-b", 72, "ok match")
+                update_job_status(db, "reject-b", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            body = json.dumps({"job_ids": ["reject-a", "reject-b"]}).encode("utf-8")
+            status_headers = {}
+
+            def start_response(status, headers, exc_info=None):
+                status_headers["status"] = status
+                status_headers["headers"] = dict(headers)
+
+            environ = {
+                "REQUEST_METHOD": "POST",
+                "PATH_INFO": "/api/workbench/reject",
+                "QUERY_STRING": "",
+                "CONTENT_LENGTH": str(len(body)),
+                "CONTENT_TYPE": "application/json",
+                "SERVER_NAME": "127.0.0.1",
+                "SERVER_PORT": "8686",
+                "wsgi.version": (1, 0),
+                "wsgi.url_scheme": "http",
+                "wsgi.input": io.BytesIO(body),
+                "wsgi.errors": io.StringIO(),
+                "wsgi.multithread": False,
+                "wsgi.multiprocess": False,
+                "wsgi.run_once": False,
+            }
+
+            # Act
+            response_body = b"".join(
+                chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                for chunk in server.app(environ, start_response)
+            ).decode("utf-8")
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                statuses = {
+                    row["id"]: row["status"]
+                    for row in verify_db.execute(
+                        "SELECT id, status FROM jobs WHERE id IN ('reject-a', 'reject-b')"
+                    ).fetchall()
+                }
+                history_actions = [
+                    dict(row)
+                    for row in verify_db.execute(
+                        "SELECT job_id, action, detail FROM history ORDER BY id"
+                    ).fetchall()
+                ]
+            finally:
+                verify_db.close()
+
+        # Assert
+        self.assertTrue(status_headers["status"].startswith("200"), response_body)
+        self.assertEqual(json.loads(response_body), {"success": True, "count": 2})
+        self.assertEqual(statuses, {"reject-a": "rejected", "reject-b": "rejected"})
+        self.assertEqual(
+            history_actions,
+            [
+                {"job_id": "reject-a", "action": "rejected", "detail": "Web Dashboard 放弃投递"},
+                {"job_id": "reject-b", "action": "rejected", "detail": "Web Dashboard 放弃投递"},
+            ],
+        )
+
+    def test_web_api_workbench_reject_rejects_mixed_status_batch_without_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("reject-safe"))
+                update_job_status(db, "reject-safe", "ready")
+                insert_job(db, _job("reject-sent"))
+                update_job_greeting(db, "reject-sent", "已发送文本")
+                update_job_status(db, "reject-sent", "sent")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/workbench/reject",
+                method="POST",
+                json_body={"job_ids": ["reject-safe", "reject-sent"]},
+            )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                rows = verify_db.execute(
+                    "SELECT id, status FROM jobs WHERE id IN ('reject-safe', 'reject-sent') ORDER BY id"
+                ).fetchall()
+                history = verify_db.execute(
+                    "SELECT action FROM history WHERE job_id IN ('reject-safe', 'reject-sent')"
+                ).fetchall()
+            finally:
+                verify_db.close()
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(payload["code"], "reject_status_blocked")
+        self.assertEqual(payload["invalid_ids"], ["reject-sent"])
+        self.assertEqual([(row["id"], row["status"]) for row in rows], [
+            ("reject-safe", "ready"),
+            ("reject-sent", "sent"),
+        ])
+        self.assertEqual(history, [])
+
+    def test_web_api_workbench_reject_allows_error_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("reject-error"))
+                update_job_status(db, "reject-error", "error")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/workbench/reject",
+                method="POST",
+                json_body={"job_ids": ["reject-error"]},
+            )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(json.loads(body), {"success": True, "count": 1})
+
+    def test_web_api_greeting_generation_rejects_scored_and_terminal_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                for job_id, status_name in (("greet-scored", "scored"), ("greet-sent", "sent")):
+                    insert_job(db, _job(job_id))
+                    update_job_greeting(db, job_id, f"{job_id} 的历史招呼语")
+                    update_job_status(db, job_id, status_name)
+                add_history(db, "greet-sent", "sent", "已发送")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch("allin.ai.greeter.generate_greetings") as generate:
+                status, _, body = self._request(
+                    "/api/workbench/greetings",
+                    method="POST",
+                    json_body={"job_ids": ["greet-scored", "greet-sent"]},
+                )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                rows = {
+                    str(row["id"]): dict(row)
+                    for row in verify_db.execute(
+                        "SELECT id, greeting, status FROM jobs WHERE id IN ('greet-scored', 'greet-sent')"
+                    ).fetchall()
+                }
+                history = verify_db.execute(
+                    "SELECT job_id, action FROM history WHERE job_id IN ('greet-scored', 'greet-sent') ORDER BY id"
+                ).fetchall()
+            finally:
+                verify_db.close()
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(payload["code"], "greeting_status_blocked")
+        self.assertEqual(payload["invalid_ids"], ["greet-scored", "greet-sent"])
+        generate.assert_not_called()
+        # PR #90 审查回归要求：接口被拒后 greeting、状态、历史记录必须完全不变。
+        self.assertEqual(rows["greet-scored"]["greeting"], "greet-scored 的历史招呼语")
+        self.assertEqual(rows["greet-scored"]["status"], "scored")
+        self.assertEqual(rows["greet-sent"]["greeting"], "greet-sent 的历史招呼语")
+        self.assertEqual(rows["greet-sent"]["status"], "sent")
+        self.assertEqual(
+            [(str(entry["job_id"]), entry["action"]) for entry in history],
+            [("greet-sent", "sent")],
+        )
+
+    def test_web_api_greeting_generation_starts_background_task_for_error_status(self):
+        seen_configs: list[dict] = []
+
+        def fake_generate(config, job_ids=None, db_path=None):
+            seen_configs.append(dict(config))
+            config["_workbench_greeting_report"] = {
+                "requested_count": 1,
+                "generated_count": 1,
+                "skipped_existing": 0,
+                "failed_count": 0,
+                "conflict_ids": [],
+            }
+            return 1
+
+        runner = WorkbenchTaskRunner({"greet": server._execute_greet})
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("greet-error"))
+                update_job_status(db, "greet-error", "error")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch("allin.ai.greeter.generate_greetings", side_effect=fake_generate), \
+            patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+                 patch.object(server, "load_config", return_value={}), \
+                 patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/greetings",
+                    method="POST",
+                    json_body={"job_ids": ["greet-error"], "regenerate": True},
+                )
+            runner.wait(timeout=2)
+            result = runner.status()["last_task"]
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["task"]["mode"], "greet")
+        self.assertEqual(payload["task"]["status"], "running")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["metrics"]["greet_generated"], 1)
+        self.assertEqual(seen_configs[0]["_workbench_job_ids"], ["greet-error"])
+        self.assertTrue(seen_configs[0]["_workbench_regenerate"])
+        self.assertIsNotNone(seen_configs[0].get("_workbench_stop_event"))
+        self.assertTrue(callable(seen_configs[0].get("_workbench_log")))
+        self.assertIn("开始为 1 个岗位生成招呼语", result["logs"][0])
+
+    def test_web_api_greeting_generation_rejected_while_task_running(self):
+        started = Event()
+        release = Event()
+
+        def blocking_executor(task, config):
+            started.set()
+            release.wait(timeout=2)
+
+        runner = WorkbenchTaskRunner({"collect": blocking_executor, "greet": server._execute_greet})
+        task = runner.start("collect", {})
+        try:
+            self.assertTrue(started.wait(timeout=1))
+            with tempfile.TemporaryDirectory() as tmp:
+                base_dir = Path(tmp)
+                db = get_db(base_dir / "data" / "allin.db")
+                try:
+                    insert_job(db, _job("greet-busy"))
+                    update_job_status(db, "greet-busy", "ready")
+                finally:
+                    db.close()
+                server.set_base_dir(base_dir)
+
+                with patch.object(server, "task_runner", runner):
+                    status, _, body = self._request(
+                        "/api/workbench/greetings",
+                        method="POST",
+                        json_body={"job_ids": ["greet-busy"]},
+                    )
+        finally:
+            release.set()
+            runner.wait(timeout=2)
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertIn("正在运行", payload["error"])
+        self.assertEqual(task["mode"], "collect")
+
+    def test_greet_task_failure_keeps_jobs_retryable(self):
+        def failing_generate(config, job_ids=None, db_path=None):
+            raise RuntimeError("AI 服务暂不可用")
+
+        runner = WorkbenchTaskRunner({"greet": server._execute_greet})
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("greet-ai-fail"))
+                update_job_status(db, "greet-ai-fail", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch("allin.ai.greeter.generate_greetings", side_effect=failing_generate), \
+            patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+                 patch.object(server, "load_config", return_value={}), \
+                 patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/greetings",
+                    method="POST",
+                    json_body={"job_ids": ["greet-ai-fail"]},
+                )
+            runner.wait(timeout=2)
+            result = runner.status()["last_task"]
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                row = verify_db.execute(
+                    "SELECT greeting, status FROM jobs WHERE id = 'greet-ai-fail'"
+                ).fetchone()
+            finally:
+                verify_db.close()
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("AI 服务暂不可用", result["error"])
+        # AI 异常不落库：岗位保持原状态与空招呼语，可重试。
+        self.assertIsNone(row["greeting"])
+        self.assertEqual(row["status"], "ready")
+
+    def test_greet_task_marks_zero_output_pause_as_failed(self):
+        # 审计回归：服务级 AI 故障且零产出时，任务不得伪装成 completed。
+        def paused_generate(config, job_ids=None, db_path=None):
+            config["_workbench_greeting_report"] = {
+                "requested_count": 1,
+                "generated_count": 0,
+                "skipped_existing": 0,
+                "failed_count": 0,
+                "conflict_ids": [],
+                "pause_reason": "AI 账户额度不足 (quota, status=402)",
+            }
+            return 0
+
+        runner = WorkbenchTaskRunner({"greet": server._execute_greet})
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("greet-quota-paused"))
+                update_job_status(db, "greet-quota-paused", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch("allin.ai.greeter.generate_greetings", side_effect=paused_generate), \
+            patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+                 patch.object(server, "load_config", return_value={}), \
+                 patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/greetings",
+                    method="POST",
+                    json_body={"job_ids": ["greet-quota-paused"]},
+                )
+            runner.wait(timeout=2)
+            result = runner.status()["last_task"]
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), payload)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("已安全暂停", result["error"])
+        self.assertIn("额度不足", result["error"])
+        self.assertEqual(result["metrics"]["greet_paused"], 1)
+        self.assertEqual(result["metrics"]["greet_generated"], 0)
+        self.assertEqual(result["metrics"]["greet_pause_reason"], "AI 账户额度不足 (quota, status=402)")
+        self.assertTrue(any("AI 服务异常，任务提前结束" in message for message in result["logs"]))
+
+    def test_greet_task_partial_pause_completes_with_annotation(self):
+        # 部分成功的服务级故障保留 completed，但必须显式标注提前结束。
+        def partial_paused_generate(config, job_ids=None, db_path=None):
+            config["_workbench_greeting_report"] = {
+                "requested_count": 2,
+                "generated_count": 1,
+                "skipped_existing": 0,
+                "failed_count": 0,
+                "conflict_ids": [],
+                "pause_reason": "API 请求被限流 (rate_limit)",
+            }
+            return 1
+
+        runner = WorkbenchTaskRunner({"greet": server._execute_greet})
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                for job_id in ("greet-done", "greet-remaining"):
+                    insert_job(db, _job(job_id))
+                    update_job_status(db, job_id, "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch("allin.ai.greeter.generate_greetings", side_effect=partial_paused_generate), \
+            patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+                 patch.object(server, "load_config", return_value={}), \
+                 patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/greetings",
+                    method="POST",
+                    json_body={"job_ids": ["greet-done", "greet-remaining"]},
+                )
+            runner.wait(timeout=2)
+            result = runner.status()["last_task"]
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), payload)
+        self.assertEqual(result["status"], "completed")
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["metrics"]["greet_generated"], 1)
+        self.assertEqual(result["metrics"]["greet_paused"], 1)
+        self.assertEqual(result["metrics"]["greet_pause_reason"], "API 请求被限流 (rate_limit)")
+        self.assertTrue(any("本轮提前结束" in message for message in result["logs"]))
+        self.assertTrue(any("rate_limit" in message for message in result["logs"]))
+
+    def test_greet_task_fails_fast_without_resume(self):
+        # 审计 P1 回归：缺简历属于配置阻断，任务必须 failed 并携带原因，不得伪装成 completed。
+        runner = WorkbenchTaskRunner({"greet": server._execute_greet})
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("greet-no-resume"))
+                update_job_status(db, "greet-no-resume", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch("allin.ai.greeter._get_resume_summary", return_value=""), \
+                 patch("allin.ai.greeter.generate_greetings") as generate, \
+                 patch.object(server, "load_config", return_value={}), \
+                 patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/greetings",
+                    method="POST",
+                    json_body={"job_ids": ["greet-no-resume"]},
+                )
+            runner.wait(timeout=2)
+            result = runner.status()["last_task"]
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), payload)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("无法读取简历", result["error"])
+        generate.assert_not_called()
+
+    def test_save_generated_greeting_rejects_allowed_status_transition(self):
+        # 审计 P2 回归：approved→error 等允许状态间的并发变化必须拒绝，不能写回 ready。
+        with tempfile.TemporaryDirectory() as tmp:
+            db = get_db(Path(tmp) / "data" / "allin.db")
+            try:
+                insert_job(db, _job("cas-transition"))
+                update_job_status(db, "cas-transition", "approved")
+                # 模拟读取（approved）之后、写入之前状态被并发改为 error
+                update_job_status(db, "cas-transition", "error")
+
+                self.assertFalse(
+                    save_generated_greeting(
+                        db, "cas-transition", "AI 新招呼语", expected_status="approved"
+                    )
+                )
+                row = db.execute(
+                    "SELECT greeting, status FROM jobs WHERE id = 'cas-transition'"
+                ).fetchone()
+                self.assertIsNone(row["greeting"])
+                self.assertEqual(row["status"], "error")
+
+                # 不传 expected_status 维持旧行为：允许集合内仍可写入
+                self.assertTrue(save_generated_greeting(db, "cas-transition", "AI 新招呼语"))
+                row = db.execute(
+                    "SELECT greeting, status FROM jobs WHERE id = 'cas-transition'"
+                ).fetchone()
+                self.assertEqual(row["greeting"], "AI 新招呼语")
+                self.assertEqual(row["status"], "ready")
+            finally:
+                db.close()
+
+    def test_mark_existing_greeting_ready_rejects_allowed_status_transition(self):
+        # Codex 审计 P2 回归：保留现有招呼语同样必须钉扎状态，approved→error 后不得复活为 ready。
+        with tempfile.TemporaryDirectory() as tmp:
+            db = get_db(Path(tmp) / "data" / "allin.db")
+            try:
+                insert_job(db, _job("preserve-transition"))
+                update_job_greeting(db, "preserve-transition", "人工编辑的招呼语")
+                update_job_status(db, "preserve-transition", "approved")
+                # 模拟读取（approved）之后、保留之前状态被并发改为 error
+                update_job_status(db, "preserve-transition", "error")
+
+                self.assertFalse(
+                    mark_existing_greeting_ready(
+                        db,
+                        "preserve-transition",
+                        expected_greeting="人工编辑的招呼语",
+                        expected_status="approved",
+                    )
+                )
+                row = db.execute(
+                    "SELECT greeting, status FROM jobs WHERE id = 'preserve-transition'"
+                ).fetchone()
+                self.assertEqual(row["status"], "error")
+            finally:
+                db.close()
+
+    def test_generic_task_endpoint_rejects_greet_mode(self):
+        # Codex 审计 P2 回归：通用任务入口无岗位选择，greet 必须走专用接口，杜绝零岗位成功任务。
+        with patch.object(server, "load_config", return_value={}), \
+             patch.object(server, "_preflight_messages", return_value=[]):
+            status, _, body = self._request(
+                "/api/workbench/task",
+                method="POST",
+                json_body={"mode": "greet"},
+            )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("400"), body)
+        self.assertIn("生成打招呼用语", payload["error"])
+
+    def test_greeting_edit_blocked_while_delivery_task_active(self):
+        # Codex 审计 P2 回归：投递任务运行期间编辑招呼语必须 409，防止平台发旧文本、库里存新文本。
+        active_task = WorkbenchTask(id="active-delivery", mode="deliver", label="确认投递")
+        runner = WorkbenchTaskRunner()
+        runner._tasks[active_task.id] = active_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("edit-busy"))
+                update_job_greeting(db, "edit-busy", "原招呼语")
+                update_job_status(db, "edit-busy", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/jobs/edit-busy/greeting",
+                    method="POST",
+                    json_body={"confirmed": True, "greeting": "投递期间的新文本"},
+                )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                row = verify_db.execute(
+                    "SELECT greeting FROM jobs WHERE id = 'edit-busy'"
+                ).fetchone()
+            finally:
+                verify_db.close()
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(payload["code"], "greeting_edit_busy")
+        self.assertEqual(row["greeting"], "原招呼语")
+
+    def test_greeting_edit_blocked_while_monitor_task_active(self):
+        # Codex 审计 P2 回归：monitor 任务内部也会发送，编辑拦截集合必须覆盖 monitor。
+        active_task = WorkbenchTask(id="active-monitor", mode="monitor", label="单独监测")
+        runner = WorkbenchTaskRunner()
+        runner._tasks[active_task.id] = active_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("edit-monitor-busy"))
+                update_job_greeting(db, "edit-monitor-busy", "原招呼语")
+                update_job_status(db, "edit-monitor-busy", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/jobs/edit-monitor-busy/greeting",
+                    method="POST",
+                    json_body={"confirmed": True, "greeting": "监测期间的新文本"},
+                )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(payload["code"], "greeting_edit_busy")
+
+    def test_full_flow_does_not_auto_send_ready_drafts_without_confirmation(self):
+        # Codex 审计 P1 回归：只生成过草稿（ready）未经确认，全流程启动不得自动发送积压。
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("draft-only"))
+                update_job_greeting(db, "draft-only", "未确认的草稿招呼语")
+                update_job_status(db, "draft-only", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            task = WorkbenchTask(id="full-draft", mode="full", label="运行全流程")
+            with patch.object(server, "_execute_collect"), \
+                 patch.object(server, "_execute_deliver") as deliver, \
+                 patch.object(server, "_execute_monitor"):
+                server._execute_full(task, {"scoring": {"threshold": 71}})
+
+        deliver.assert_not_called()
+        self.assertTrue(any("未经人工确认不会自动发送" in message for message in task.logs))
+
+    def test_full_flow_delivers_only_confirmed_jobs(self):
+        # Codex 复审 P1 回归：确认范围必须精确——确认 B 不得连带发送未确认的积压 A；
+        # 积压仅提示走「直接发送」，投递次数恰为 1 且只含被确认岗位。
+        from threading import Thread
+        from time import sleep, time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("backlog-a"))
+                update_job_greeting(db, "backlog-a", "未确认的积压草稿")
+                update_job_status(db, "backlog-a", "ready")
+                insert_job(db, _job("confirmed-b"))
+                update_job_score(db, "confirmed-b", 90, "匹配")
+                update_job_status(db, "confirmed-b", "approved")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            task = WorkbenchTask(id="full-precise", mode="full", label="运行全流程")
+            with patch.object(server, "_execute_collect"), \
+                 patch.object(server, "_execute_deliver") as deliver, \
+                 patch.object(server, "_wait_for_collection_delivery_cooldown") as cooldown, \
+                 patch.object(server, "_execute_monitor"):
+                cooldown.return_value = False
+                thread = Thread(target=server._execute_full, args=(task, {"scoring": {"threshold": 71}}), daemon=True)
+                thread.start()
+                deadline = time() + 3
+                while time() < deadline and not task.context.get("waiting_confirmation"):
+                    sleep(0.02)
+                self.assertTrue(task.context.get("waiting_confirmation"), task.logs)
+                # 确认前：零投递
+                self.assertEqual(deliver.call_count, 0)
+                task.context["confirmed_job_ids"] = ["confirmed-b"]
+                task.context["confirmation_event"].set()
+                thread.join(timeout=3)
+
+        self.assertFalse(thread.is_alive())
+        # 只发送被明确确认的 B；积压 A 不在任何投递调用中
+        self.assertEqual(deliver.call_count, 1)
+        delivered_ids = deliver.call_args_list[0].args[1]["_workbench_job_ids"]
+        self.assertEqual(delivered_ids, ["confirmed-b"])
+        self.assertNotIn("backlog-a", delivered_ids)
+        self.assertTrue(any("不在本次确认范围" in message for message in task.logs))
+
+    def test_greet_task_pins_runtime_database_path(self):
+        # Codex 审计 P2 回归：后台生成必须使用面板运行时数据库，而非 CWD 相对默认库。
+        runner = WorkbenchTaskRunner({"greet": server._execute_greet})
+        captured: dict = {}
+
+        def fake_generate(config, job_ids=None, db_path=None):
+            captured["db_path"] = db_path
+            config["_workbench_greeting_report"] = {
+                "requested_count": 1,
+                "generated_count": 1,
+                "skipped_existing": 0,
+                "failed_count": 0,
+                "conflict_ids": [],
+            }
+            return 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("greet-db-path"))
+                update_job_status(db, "greet-db-path", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch("allin.ai.greeter.generate_greetings", side_effect=fake_generate), \
+                 patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+                 patch.object(server, "load_config", return_value={}), \
+                 patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/greetings",
+                    method="POST",
+                    json_body={"job_ids": ["greet-db-path"]},
+                )
+            runner.wait(timeout=2)
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(captured["db_path"], server.DATA_DIR / "allin.db")
+        self.assertTrue(str(captured["db_path"]).endswith("allin.db"))
+
+    def test_web_api_greeting_generation_reports_conflict_ids_on_cas_failure(self):
+        def fake_generate(config, job_ids=None, db_path=None):
+            config["_workbench_greeting_report"] = {
+                "requested_count": 1,
+                "generated_count": 0,
+                "skipped_existing": 0,
+                "failed_count": 0,
+                "conflict_ids": ["greet-cas"],
+            }
+            return 0
+
+        runner = WorkbenchTaskRunner({"greet": server._execute_greet})
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("greet-cas"))
+                update_job_status(db, "greet-cas", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch("allin.ai.greeter.generate_greetings", side_effect=fake_generate), \
+            patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+                 patch.object(server, "load_config", return_value={}), \
+                 patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/greetings",
+                    method="POST",
+                    json_body={"job_ids": ["greet-cas"]},
+                )
+            runner.wait(timeout=2)
+            result = runner.status()["last_task"]
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["task"]["mode"], "greet")
+        # CAS 冲突在任务完成后经 metrics/progress 上报，不再阻塞 HTTP 响应。
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["metrics"]["greet_conflicts"], 1)
+        self.assertEqual(result["progress"]["conflict_ids"], ["greet-cas"])
+        self.assertTrue(any("状态冲突 1" in message for message in result["logs"]))
+
+    def test_web_api_greeting_generation_reports_partial_conflict_with_success(self):
+        def fake_generate(config, job_ids=None, db_path=None):
+            config["_workbench_greeting_report"] = {
+                "requested_count": 2,
+                "generated_count": 1,
+                "skipped_existing": 0,
+                "failed_count": 0,
+                "conflict_ids": ["greet-conflict"],
+            }
+            return 1
+
+        runner = WorkbenchTaskRunner({"greet": server._execute_greet})
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("greet-ok"))
+                update_job_status(db, "greet-ok", "ready")
+                insert_job(db, _job("greet-conflict"))
+                update_job_status(db, "greet-conflict", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch("allin.ai.greeter.generate_greetings", side_effect=fake_generate), \
+            patch("allin.ai.greeter._get_resume_summary", return_value="简历摘要"), \
+                 patch.object(server, "load_config", return_value={}), \
+                 patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/workbench/greetings",
+                    method="POST",
+                    json_body={"job_ids": ["greet-ok", "greet-conflict"]},
+                )
+            runner.wait(timeout=2)
+            result = runner.status()["last_task"]
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["metrics"]["greet_generated"], 1)
+        self.assertEqual(result["metrics"]["greet_conflicts"], 1)
+        self.assertEqual(result["progress"]["conflict_ids"], ["greet-conflict"])
+
+    def test_web_api_greeting_edit_blocks_sent_without_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("edit-sent"))
+                update_job_greeting(db, "edit-sent", "原招呼语")
+                update_job_status(db, "edit-sent", "sent")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/edit-sent/greeting",
+                method="POST",
+                json_body={"confirmed": True, "greeting": "不应保存的新招呼语"},
+            )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                row = verify_db.execute(
+                    "SELECT greeting, status FROM jobs WHERE id = 'edit-sent'"
+                ).fetchone()
+                history = verify_db.execute(
+                    "SELECT action FROM history WHERE job_id = 'edit-sent'"
+                ).fetchall()
+            finally:
+                verify_db.close()
+
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(json.loads(body)["code"], "greeting_status_blocked")
+        self.assertEqual((row["greeting"], row["status"]), ("原招呼语", "sent"))
+        self.assertEqual(history, [])
+
+    def test_web_api_greeting_edit_allows_error_and_keeps_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("edit-error"))
+                update_job_status(db, "edit-error", "error")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/edit-error/greeting",
+                method="POST",
+                json_body={"confirmed": True, "greeting": "人工修正后的招呼语"},
+            )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                row = verify_db.execute(
+                    "SELECT greeting, status FROM jobs WHERE id = 'edit-error'"
+                ).fetchone()
+                history = verify_db.execute(
+                    "SELECT action, detail FROM history WHERE job_id = 'edit-error'"
+                ).fetchall()
+            finally:
+                verify_db.close()
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual((row["greeting"], row["status"]), ("人工修正后的招呼语", "error"))
+        self.assertEqual([(item["action"], item["detail"]) for item in history], [
+            ("greeting_edited", "Web Dashboard 编辑招呼语"),
+        ])
+
+    def test_web_api_greeting_edit_rejects_over_300_characters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("edit-too-long"))
+                update_job_status(db, "edit-too-long", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/edit-too-long/greeting",
+                method="POST",
+                json_body={"confirmed": True, "greeting": "长" * 301},
+            )
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertIn("300", json.loads(body)["error"])
+
+    def test_db_greeting_mutations_refuse_terminal_or_stale_statuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = get_db(Path(tmp) / "allin.db")
+            try:
+                insert_job(db, _job("db-ready"))
+                update_job_status(db, "db-ready", "ready")
+                self.assertTrue(save_generated_greeting(db, "db-ready", "AI 招呼语"))
+
+                insert_job(db, _job("db-manual-race"))
+                update_job_status(db, "db-manual-race", "ready")
+                update_job_greeting(db, "db-manual-race", "并发人工编辑")
+                self.assertFalse(save_generated_greeting(
+                    db,
+                    "db-manual-race",
+                    "过期 AI 结果",
+                    expected_greeting="旧快照",
+                ))
+
+                insert_job(db, _job("db-sent"))
+                update_job_greeting(db, "db-sent", "已发送文本")
+                update_job_status(db, "db-sent", "sent")
+                self.assertFalse(save_generated_greeting(db, "db-sent", "不应保存"))
+                self.assertFalse(edit_job_greeting(db, "db-sent", "不应编辑", expected_status="sent"))
+
+                insert_job(db, _job("db-existing"))
+                update_job_greeting(db, "db-existing", "人工文本")
+                update_job_status(db, "db-existing", "approved")
+                self.assertFalse(mark_existing_greeting_ready(
+                    db,
+                    "db-existing",
+                    expected_greeting="旧快照",
+                ))
+
+                insert_job(db, _job("db-reject-ready"))
+                update_job_status(db, "db-reject-ready", "ready")
+                insert_job(db, _job("db-reject-scored"))
+                update_job_status(db, "db-reject-scored", "scored")
+                result = reject_jobs(db, ["db-reject-ready", "db-reject-scored"])
+                self.assertEqual(result["affected_count"], 0)
+                self.assertEqual(result["invalid_ids"], ["db-reject-scored"])
+
+                rows = {
+                    row["id"]: dict(row)
+                    for row in db.execute(
+                        "SELECT id, greeting, status FROM jobs WHERE id LIKE 'db-%'"
+                    ).fetchall()
+                }
+                history = db.execute(
+                    "SELECT action FROM history WHERE job_id LIKE 'db-%'"
+                ).fetchall()
+            finally:
+                db.close()
+
+        self.assertEqual((rows["db-manual-race"]["greeting"], rows["db-manual-race"]["status"]), ("并发人工编辑", "ready"))
+        self.assertEqual((rows["db-sent"]["greeting"], rows["db-sent"]["status"]), ("已发送文本", "sent"))
+        self.assertEqual(rows["db-existing"]["status"], "approved")
+        self.assertEqual(rows["db-reject-ready"]["status"], "ready")
+        self.assertEqual(rows["db-reject-scored"]["status"], "scored")
+        self.assertEqual(history, [])
+
+    def test_web_api_workbench_reject_removes_jobs_from_pending_confirmation(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("reject-visible"))
+                update_job_score(db, "reject-visible", 82, "good match")
+                update_job_status(db, "reject-visible", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            body = json.dumps({"job_ids": ["reject-visible"]}).encode("utf-8")
+            status_headers = {}
+
+            def start_response(status, headers, exc_info=None):
+                status_headers["status"] = status
+                status_headers["headers"] = dict(headers)
+
+            environ = {
+                "REQUEST_METHOD": "POST",
+                "PATH_INFO": "/api/workbench/reject",
+                "QUERY_STRING": "",
+                "CONTENT_LENGTH": str(len(body)),
+                "CONTENT_TYPE": "application/json",
+                "SERVER_NAME": "127.0.0.1",
+                "SERVER_PORT": "8686",
+                "wsgi.version": (1, 0),
+                "wsgi.url_scheme": "http",
+                "wsgi.input": io.BytesIO(body),
+                "wsgi.errors": io.StringIO(),
+                "wsgi.multithread": False,
+                "wsgi.multiprocess": False,
+                "wsgi.run_once": False,
+            }
+
+            # Act
+            response_body = b"".join(
+                chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                for chunk in server.app(environ, start_response)
+            ).decode("utf-8")
+            workbench_status, _, workbench_body = self._request("/api/workbench")
+
+        # Assert
+        self.assertTrue(status_headers["status"].startswith("200"), response_body)
+        self.assertTrue(workbench_status.startswith("200"), workbench_body)
+        self.assertEqual(json.loads(workbench_body)["pending_confirmation"], [])
+
+    def test_web_api_resume_delete_only_detaches_config_and_keeps_master_resume_file(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            resume_path = base_dir / "data" / "resumes" / "_AI_Homepage.md"
+            resume_path.parent.mkdir(parents=True, exist_ok=True)
+            resume_path.write_text("# 主简历\n\n完整事实库，不能删减。\n", encoding="utf-8")
+            (base_dir / "config.yaml").write_text(
+                yaml.dump({"profile": {"resume_path": str(resume_path)}}, allow_unicode=True),
+                encoding="utf-8",
+            )
+            server.set_base_dir(base_dir)
+
+            # Act
+            status, _, body = self._request("/api/resume", method="DELETE")
+            config = yaml.safe_load((base_dir / "config.yaml").read_text(encoding="utf-8"))
+
+            # Assert
+            self.assertTrue(status.startswith("200"), body)
+            self.assertEqual(json.loads(body), {"success": True})
+            self.assertTrue(resume_path.exists())
+            self.assertEqual(config["profile"]["resume_path"], "")
+
+    def test_web_api_resume_upload_preserves_chinese_markdown_filename(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+            content = "# 张三\n\n产品经理\n".encode("utf-8")
+
+            # Act
+            status, _, body = self._upload_resume("张三的中文简历.md", content, "text/markdown")
+            payload = json.loads(body)
+            stored_path = Path(payload["path"])
+            config = yaml.safe_load((base_dir / "config.yaml").read_text(encoding="utf-8"))
+
+            # Assert
+            self.assertTrue(status.startswith("200"), body)
+            self.assertEqual(payload["filename"], "张三的中文简历.md")
+            self.assertEqual(stored_path.read_bytes(), content)
+            self.assertEqual(config["profile"]["resume_path"], str(stored_path))
+
+    def test_web_api_resume_upload_converts_docx_to_markdown(self):
+        # Arrange
+        document_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:body>
+            <w:p>
+              <w:pPr><w:pStyle w:val="Title"/></w:pPr>
+              <w:r><w:t>李雷</w:t></w:r>
+            </w:p>
+            <w:p>
+              <w:pPr><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr>
+              <w:r><w:t>5 年产品经验</w:t></w:r>
+            </w:p>
+          </w:body>
+        </w:document>"""
+        docx_buffer = io.BytesIO()
+        with ZipFile(docx_buffer, "w") as archive:
+            archive.writestr("word/document.xml", document_xml)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+
+            # Act
+            status, _, body = self._upload_resume(
+                "李雷简历.docx",
+                docx_buffer.getvalue(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            payload = json.loads(body)
+            stored_path = Path(payload["path"])
+            stored_content = stored_path.read_text(encoding="utf-8")
+
+            # Assert
+            self.assertTrue(status.startswith("200"), body)
+            self.assertEqual(payload["filename"], "李雷简历.md")
+            self.assertEqual(stored_path.suffix, ".md")
+            self.assertIn("# 李雷", stored_content)
+            self.assertIn("- 5 年产品经验", stored_content)
+
+    def test_web_api_resume_upload_extracts_text_layer_from_pdf(self):
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=612, height=792)
+        font = DictionaryObject({
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        })
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+        })
+        contents = DecodedStreamObject()
+        contents.set_data(b"BT /F1 12 Tf 72 720 Td (Jane Resume - Product Manager) Tj ET")
+        page[NameObject("/Contents")] = contents
+        pdf = io.BytesIO()
+        writer.write(pdf)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._upload_resume("resume.pdf", pdf.getvalue(), "application/pdf")
+            payload = json.loads(body)
+            stored_path = Path(payload["path"])
+            stored_text = stored_path.read_text(encoding="utf-8")
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["filename"], "resume.md")
+        self.assertIn("Jane Resume - Product Manager", stored_text)
+
+    def test_web_api_resume_upload_rejects_encrypted_pdf(self):
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        writer.encrypt("secret")
+        pdf = io.BytesIO()
+        writer.write(pdf)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+            status, _, body = self._upload_resume("encrypted.pdf", pdf.getvalue(), "application/pdf")
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body), {"error": "PDF 已加密，请上传未加密的简历"})
+
+    def test_web_api_resume_upload_rejects_damaged_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+            status, _, body = self._upload_resume("damaged.pdf", b"%PDF-1.7\nbroken", "application/pdf")
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body), {"error": "PDF 文件无效或已损坏"})
+
+    def test_web_api_resume_upload_rejects_scanned_pdf_without_text_layer(self):
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        pdf = io.BytesIO()
+        writer.write(pdf)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+            status, _, body = self._upload_resume("scanned.pdf", pdf.getvalue(), "application/pdf")
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertIn("扫描版或无文字层", json.loads(body)["error"])
+
+    def test_web_api_resume_upload_rejects_legacy_doc_format(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            server.set_base_dir(base_dir)
+
+            # Act
+            status, _, body = self._upload_resume("旧版简历.doc", b"not-a-word-file", "application/msword")
+
+            # Assert
+            self.assertTrue(status.startswith("400"), body)
+            self.assertEqual(json.loads(body), {"error": "仅支持 .md、.docx 或 .pdf 格式"})
+
+    def test_web_api_history_open_chat_selects_the_recorded_boss_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("open-chat"))
+                add_history(db, "open-chat", "replied", "已回复")
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ?",
+                    ("open-chat",),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server.task_runner, "status", return_value={"active": None}), \
+                 patch(
+                     "allin.executor.monitor._open_conversation_from_chat_list",
+                     return_value="chat-target",
+                 ) as open_conversation:
+                status, _, body = self._request(
+                    f"/api/history/{history_id}/open-chat",
+                    method="POST",
+                    json_body={},
+                )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertTrue(json.loads(body)["success"])
+        selected_job = open_conversation.call_args.args[0]
+        self.assertEqual(selected_job["id"], "open-chat")
+        self.assertFalse(open_conversation.call_args.kwargs["background"])
+
+    def test_web_api_detected_reply_prepares_only_that_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "config.yaml").write_text("{}\n", encoding="utf-8")
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("prepare-reply"))
+                add_history(db, "prepare-reply", "hr_reply_detected", "检测到新消息")
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ?",
+                    ("prepare-reply",),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            with patch.object(server.task_runner, "status", return_value={"active": None}), \
+                 patch(
+                     "allin.executor.monitor.process_detected_reply",
+                     return_value={"pending": 1, "failed": 0},
+                 ) as process_reply:
+                status, _, body = self._request(
+                    f"/api/history/{history_id}/prepare-reply",
+                    method="POST",
+                    json_body={},
+                )
+                process_reply.return_value = {"pending": 0, "failed": 1}
+                failed_status, _, failed_body = self._request(
+                    f"/api/history/{history_id}/prepare-reply",
+                    method="POST",
+                    json_body={},
+                )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertTrue(json.loads(body)["success"])
+        self.assertTrue(failed_status.startswith("502"), failed_body)
+        self.assertEqual(process_reply.call_count, 2)
+        self.assertEqual(process_reply.call_args.args[0], "prepare-reply")
+
+    def test_web_api_history_dismiss_reply_adds_dismissed_history_without_rejecting_job(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("reply-dismiss"))
+                update_job_status(db, "reply-dismiss", "sent")
+                add_history(db, "reply-dismiss", "reply_pending", "AI建议回复")
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = ?",
+                    ("reply-dismiss", "reply_pending"),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            body = b"{}"
+            status_headers = {}
+
+            def start_response(status, headers, exc_info=None):
+                status_headers["status"] = status
+                status_headers["headers"] = dict(headers)
+
+            environ = {
+                "REQUEST_METHOD": "POST",
+                "PATH_INFO": f"/api/history/{history_id}/dismiss",
+                "QUERY_STRING": "",
+                "CONTENT_LENGTH": str(len(body)),
+                "CONTENT_TYPE": "application/json",
+                "SERVER_NAME": "127.0.0.1",
+                "SERVER_PORT": "8686",
+                "wsgi.version": (1, 0),
+                "wsgi.url_scheme": "http",
+                "wsgi.input": io.BytesIO(body),
+                "wsgi.errors": io.StringIO(),
+                "wsgi.multithread": False,
+                "wsgi.multiprocess": False,
+                "wsgi.run_once": False,
+            }
+
+            # Act
+            response_body = b"".join(
+                chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                for chunk in server.app(environ, start_response)
+            ).decode("utf-8")
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                job_status = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?", ("reply-dismiss",)
+                ).fetchone()["status"]
+                history_actions = [
+                    dict(row)
+                    for row in verify_db.execute(
+                        "SELECT job_id, action, detail FROM history ORDER BY id"
+                    ).fetchall()
+                ]
+            finally:
+                verify_db.close()
+
+        # Assert
+        self.assertTrue(status_headers["status"].startswith("200"), response_body)
+        self.assertEqual(json.loads(response_body), {"success": True})
+        self.assertEqual(job_status, "sent")
+        self.assertEqual(history_actions[0], {"job_id": "reply-dismiss", "action": "reply_pending", "detail": "AI建议回复"})
+        self.assertEqual(history_actions[1]["job_id"], "reply-dismiss")
+        self.assertEqual(history_actions[1]["action"], "reply_dismissed")
+        self.assertIn("Web Dashboard 放弃回复建议", history_actions[1]["detail"])
+
+    def test_web_api_history_reply_records_resolution_history(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("reply-confirm"))
+                update_job_status(db, "reply-confirm", "sent")
+                add_history(db, "reply-confirm", "reply_pending", "AI建议回复")
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = ?",
+                    ("reply-confirm", "reply_pending"),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            body = json.dumps({"message": "已手动回复 HR"}).encode("utf-8")
+            status_headers = {}
+
+            def start_response(status, headers, exc_info=None):
+                status_headers["status"] = status
+                status_headers["headers"] = dict(headers)
+
+            environ = {
+                "REQUEST_METHOD": "POST",
+                "PATH_INFO": f"/api/history/{history_id}/reply",
+                "QUERY_STRING": "",
+                "CONTENT_LENGTH": str(len(body)),
+                "CONTENT_TYPE": "application/json",
+                "SERVER_NAME": "127.0.0.1",
+                "SERVER_PORT": "8686",
+                "wsgi.version": (1, 0),
+                "wsgi.url_scheme": "http",
+                "wsgi.input": io.BytesIO(body),
+                "wsgi.errors": io.StringIO(),
+                "wsgi.multithread": False,
+                "wsgi.multiprocess": False,
+                "wsgi.run_once": False,
+            }
+
+            # Act
+            response_body = b"".join(
+                chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                for chunk in server.app(environ, start_response)
+            ).decode("utf-8")
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                history_actions = [
+                    dict(row)
+                    for row in verify_db.execute(
+                        "SELECT job_id, action, detail FROM history ORDER BY id"
+                    ).fetchall()
+                ]
+                job_status = verify_db.execute(
+                    "SELECT status FROM jobs WHERE id = ?", ("reply-confirm",)
+                ).fetchone()["status"]
+            finally:
+                verify_db.close()
+
+        # Assert
+        self.assertTrue(status_headers["status"].startswith("200"), response_body)
+        self.assertEqual(json.loads(response_body)["success"], True)
+        self.assertEqual(job_status, "replied")
+        self.assertEqual(history_actions[0], {"job_id": "reply-confirm", "action": "reply_pending", "detail": "AI建议回复"})
+        self.assertEqual(history_actions[1]["job_id"], "reply-confirm")
+        self.assertEqual(history_actions[1]["action"], "replied")
+        self.assertIn("已手动回复 HR", history_actions[1]["detail"])
+
+    def test_web_api_history_reply_confirmation_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("reply-once"))
+                add_history(db, "reply-once", "reply_pending", "AI建议回复")
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = 'reply_pending'",
+                    ("reply-once",),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            first_status, _, first_body = self._request(
+                f"/api/history/{history_id}/reply",
+                method="POST",
+                json_body={"message": "已手动回复 HR"},
+            )
+            second_status, _, second_body = self._request(
+                f"/api/history/{history_id}/reply",
+                method="POST",
+                json_body={"message": "已手动回复 HR"},
+            )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                reply_count = verify_db.execute(
+                    "SELECT COUNT(*) FROM history WHERE job_id = ? AND action = 'replied'",
+                    ("reply-once",),
+                ).fetchone()[0]
+            finally:
+                verify_db.close()
+
+        self.assertTrue(first_status.startswith("200"), first_body)
+        self.assertTrue(second_status.startswith("200"), second_body)
+        self.assertTrue(json.loads(second_body)["already_resolved"])
+        self.assertEqual(reply_count, 1)
+
+    def test_web_api_history_dismiss_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("dismiss-once"))
+                add_history(db, "dismiss-once", "reply_pending", "AI建议回复")
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = 'reply_pending'",
+                    ("dismiss-once",),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            first_status, _, first_body = self._request(
+                f"/api/history/{history_id}/dismiss",
+                method="POST",
+                json_body={},
+            )
+            second_status, _, second_body = self._request(
+                f"/api/history/{history_id}/dismiss",
+                method="POST",
+                json_body={},
+            )
+
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                dismiss_count = verify_db.execute(
+                    "SELECT COUNT(*) FROM history WHERE job_id = ? AND action = 'reply_dismissed'",
+                    ("dismiss-once",),
+                ).fetchone()[0]
+            finally:
+                verify_db.close()
+
+        self.assertTrue(first_status.startswith("200"), first_body)
+        self.assertTrue(second_status.startswith("200"), second_body)
+        self.assertTrue(json.loads(second_body)["already_resolved"])
+        self.assertEqual(dismiss_count, 1)
+
+    def test_web_api_history_dismiss_rejects_stale_reply_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("dismiss-stale"))
+                add_history(db, "dismiss-stale", "reply_pending", "第一轮建议")
+                stale_history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = 'reply_pending'",
+                    ("dismiss-stale",),
+                ).fetchone()["id"]
+                add_history(db, "dismiss-stale", "reply_pending", "第二轮建议")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                f"/api/history/{stale_history_id}/dismiss",
+                method="POST",
+                json_body={},
+            )
+
+        self.assertTrue(status.startswith("409"), body)
+        self.assertIn("最新一轮", json.loads(body)["error"])
+
+    def test_web_api_unresolved_count_includes_resume_failures_and_excludes_resolved_rows(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("reply-open"))
+                insert_job(db, _job("reply-closed"))
+                insert_job(db, _job("resume-failed-open"))
+                insert_job(db, _job("resume-failed-resolved"))
+                add_history(db, "reply-open", "reply_pending", "AI建议回复")
+                add_history(db, "reply-closed", "reply_pending", "AI建议回复")
+                add_history(db, "reply-closed", "reply_dismissed", "Web Dashboard 放弃回复建议")
+                add_history(db, "resume-failed-open", "resume_failed", "定制简历生成失败")
+                add_history(db, "resume-failed-resolved", "resume_failed", "定制简历生成失败")
+                add_history(db, "resume-failed-resolved", "needs_resume", "后来已成功生成")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            # Act
+            status, _, body = self._request("/api/history/unresolved-replies/count")
+
+        # Assert
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(json.loads(body), {"count": 2})
+
+    def test_web_api_history_can_include_unresolved_resume_failures_outside_recent_limit(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("resume-failed-open"))
+                insert_job(db, _job("resume-failed-resolved"))
+                insert_job(db, _job("reply-open"))
+                insert_job(db, _job("recent-job"))
+                add_history(db, "resume-failed-open", "resume_failed", "仍需处理")
+                add_history(db, "resume-failed-resolved", "resume_failed", "旧失败")
+                add_history(db, "resume-failed-resolved", "resume_sent", "后来已成功")
+                add_history(db, "reply-open", "reply_pending", "待确认回复")
+                add_history(db, "recent-job", "sent", "最近记录")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            # Act
+            status, _, body = self._request("/api/history?limit=1&include_unresolved=1")
+
+        # Assert
+        self.assertTrue(status.startswith("200"), body)
+        payload = json.loads(body)
+        self.assertEqual(
+            {(item["job_id"], item["action"]) for item in payload},
+            {
+                ("recent-job", "sent"),
+                ("reply-open", "reply_pending"),
+                ("resume-failed-open", "resume_failed"),
+            },
+        )
+
+    def test_web_api_history_includes_last_week_replies_outside_recent_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                for job_id in ("recent-reply", "recent-resume-sent", "expired-reply", "recent-noise"):
+                    insert_job(db, _job(job_id))
+                add_history(
+                    db,
+                    "recent-reply",
+                    "auto_replied",
+                    json.dumps({"schema": "auto_replied.v1", "ai_reply": "近一周回复"}),
+                )
+                add_history(
+                    db,
+                    "expired-reply",
+                    "replied",
+                    json.dumps({"schema": "replied.external.v1", "manual_reply": "过期回复"}),
+                )
+                add_history(
+                    db,
+                    "recent-resume-sent",
+                    "needs_resume",
+                    json.dumps({"schema": "needs_resume.v1", "conversation_tail": [{"sender": "hr", "text": "请发简历"}]}),
+                )
+                add_history(db, "recent-resume-sent", "resume_sent", "简历已发送")
+                db.execute(
+                    "UPDATE history SET created_at = datetime('now', '-8 days') WHERE job_id = ?",
+                    ("expired-reply",),
+                )
+                db.commit()
+                add_history(db, "recent-noise", "sent", "最近普通记录")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/history?limit=1&include_monitor_conversations=1"
+            )
+            full_status, _, full_body = self._request(
+                "/api/history?limit=50&include_monitor_conversations=1"
+            )
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertTrue(full_status.startswith("200"), full_body)
+        expected = {
+            ("recent-noise", "sent"),
+            ("recent-reply", "auto_replied"),
+            ("recent-resume-sent", "needs_resume"),
+            ("recent-resume-sent", "resume_sent"),
+        }
+        for payload in (body, full_body):
+            self.assertEqual(
+                {(item["job_id"], item["action"]) for item in json.loads(payload)},
+                expected,
+            )
+
+    def test_web_api_history_exposes_structured_failure_reason_and_resolution_state(self):
+        # Arrange
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("resume-failed-detail"))
+                add_history(
+                    db,
+                    "resume-failed-detail",
+                    "resume_failed",
+                    json.dumps(
+                        {
+                            "schema": "resume_failed.v2",
+                            "hr_question": "请发一份简历。",
+                            "ai_reply": "",
+                            "system_reason": "事实完整性校验失败：新增了 50%",
+                            "conversation_tail": [],
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            # Act
+            status, _, body = self._request("/api/history?limit=10&include_unresolved=1")
+            unresolved_item = json.loads(body)[0]
+
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                db.execute(
+                    "UPDATE jobs SET resume_path = ? WHERE id = ?",
+                    ("/tmp/generated.md", "resume-failed-detail"),
+                )
+                db.commit()
+            finally:
+                db.close()
+            _, _, resolved_body = self._request("/api/history?limit=10&include_unresolved=1")
+            resolved_item = json.loads(resolved_body)[0]
+
+        # Assert
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(unresolved_item["detail_payload"]["hr_question"], "请发一份简历。")
+        self.assertEqual(
+            unresolved_item["detail_payload"]["system_reason"],
+            "事实完整性校验失败：新增了 50%",
+        )
+        self.assertFalse(unresolved_item["resolved"])
+        self.assertEqual(unresolved_item["url"], "https://example.com/job")
+        self.assertEqual(unresolved_item["source_platform"], "boss")
+        self.assertTrue(resolved_item["resolved"])
+        self.assertEqual(resolved_item["resume_path"], "/tmp/generated.md")
+
+    def test_collection_resume_preflight_and_start_use_saved_search_without_saving_preferences(self):
+        config = {"search": {"keywords": ["new defaults"], "cities": ["上海"]}}
+        saved_options = server.normalize_collection_options({}, {"platform_order": ["boss"], "platforms": {
+            "boss": {"keywords": ["original"], "cities": ["北京"], "max_pages": 2,
+                     "filters": {"experience": ["1-3年"]}},
+        }})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(server, "DATA_DIR", Path(tmp)), \
+             patch.object(server, "load_config", return_value=config), \
+             patch.object(server, "_write_config") as write_config, \
+             patch.object(server, "collect_preflight_checks", return_value=[]) as preflight, \
+             patch.object(server, "_preflight_messages", return_value=[]), \
+             patch.object(server.task_runner, "start", return_value={"id": "resumed"}) as start:
+            db_path = Path(tmp) / "allin.db"
+            create_collection_run(db_path, run_id="original", options=saved_options,
+                                  platform_states={"boss": {"status": "stopped"}}, enable_boss_resume=True)
+            update_collection_run(db_path, "original", status="stopped")
+            payload = {"mode": "collect", "options": {"resume_run_id": "original",
+                       "platforms": {"boss": {"keywords": ["tampered"]}}}}
+            status, _, body = self._request("/api/collection/runs")
+            self.assertTrue(status.startswith("200"), body)
+            self.assertTrue(json.loads(body)[0]["can_resume"])
+            status, _, body = self._request("/api/workbench/preflight", "POST", payload)
+            self.assertTrue(status.startswith("200"), body)
+            self.assertEqual(preflight.call_args.args[2]["platforms"], saved_options["platforms"])
+            status, _, body = self._request("/api/workbench/task", "POST", payload)
+            self.assertTrue(status.startswith("200"), body)
+            self.assertEqual(start.call_args.args[0], "collect")
+            actual = start.call_args.args[1]["_collection_options"]
+            self.assertEqual(actual, {**saved_options, "resume_run_id": "original"})
+            write_config.assert_not_called()
+
+            for run_status in ("running", "completed"):
+                update_collection_run(db_path, "original", status=run_status)
+                start.reset_mock()
+                status, _, body = self._request("/api/workbench/task", "POST", payload)
+                self.assertTrue(status.startswith("400"), body)
+                start.assert_not_called()
+            status, _, body = self._request("/api/workbench/task", "POST", {**payload, "mode": "full"})
+            self.assertTrue(status.startswith("400"), body)
+
+    def test_starting_collection_preserves_unsubmitted_platform_search_fields(self):
+        """采集对话框只提交它编辑的字段；未提交的平台搜索设置必须保留。
+
+        回归：启动全流程曾整段替换 platforms.<平台>.search，把对话框不认识的
+        resume_ttl_hours 抹掉，导致已保存的 0（停用断点）看起来又变回默认 24。
+        """
+        config = {
+            "profile": {"target_cities": ["杭州"]},
+            "collection": {"default_order": ["zhilian"]},
+            "platforms": {
+                "zhilian": {
+                    "enabled": True,
+                    "search": {
+                        "keywords": ["旧词"],
+                        "cities": ["杭州"],
+                        "max_pages": 1,
+                        "sort": "default",
+                        "resume_ttl_hours": 0,
+                    },
+                },
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), \
+             patch.object(server, "_preflight_messages", return_value=[]), \
+             patch.object(server, "_write_config") as write_config, \
+             patch.object(server.task_runner, "start", return_value={"id": "merge-search"}) as start:
+            real_config_path = Path(server.CONFIG_PATH)
+            real_config_before = real_config_path.read_bytes() if real_config_path.is_file() else None
+            status, _, body = self._request(
+                "/api/workbench/task",
+                method="POST",
+                json_body={"mode": "collect", "options": {
+                    "platform_order": ["zhilian"],
+                    "platforms": {"zhilian": {
+                        "keywords": ["新词"], "cities": ["杭州"],
+                        "max_pages": 3, "sort": "default",
+                    }},
+                }},
+            )
+
+            self.assertTrue(status.startswith("200"), body)
+            self.assertEqual(start.call_args.args[0], "collect")
+            # before_start 是传给 task_runner 的回调，请求期间不会执行，需显式调用。
+            # 必须在 patch 生效期间调用，否则会命中真实的 _write_config 并改写真实配置。
+            call_kwargs = start.call_args.kwargs
+            self.assertIn("before_start", call_kwargs, f"start kwargs: {list(call_kwargs)}")
+            before_start = call_kwargs["before_start"]
+            self.assertIsNotNone(before_start, "采集启动应持久化平台搜索偏好")
+            before_start()
+            saved = write_config.call_args.args[0]
+            saved_search = saved["platforms"]["zhilian"]["search"]
+            # 对话框提交的字段照常生效
+            self.assertEqual(saved_search["keywords"], ["新词"])
+            self.assertEqual(saved_search["max_pages"], 3)
+            # 对话框未提交的字段被保留，而不是被整体替换掉
+            self.assertEqual(saved_search["resume_ttl_hours"], 0)
+            # 硬防线：本用例绝不能触碰真实 config.yaml。
+            real_config_after = real_config_path.read_bytes() if real_config_path.is_file() else None
+            self.assertEqual(real_config_before, real_config_after, "测试污染了真实 config.yaml")
+
+    def test_full_task_receives_global_boss_collection_options(self):
+        config = {
+            "search": {"keywords": ["旧关键词"], "cities": ["北京"]},
+            "profile": {"target_cities": ["北京"]},
+            "collection": {"default_order": ["boss"]},
+            "platforms": {
+                "boss": {"enabled": True, "search": {"keywords": ["全局关键词"], "cities": ["上海"], "max_pages": 2, "sort": "newest", "target_count": 4}},
+                "zhilian": {"enabled": False, "search": {}},
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
+            server, "_write_config"
+        ), patch.object(server.task_runner, "start", return_value={"id": "full-global-config"}) as start:
+            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "full"})
+
+        self.assertTrue(status.startswith("200"), body)
+        task_config = start.call_args.args[1]
+        self.assertEqual(task_config["_collection_options"]["platforms"]["boss"]["keywords"], ["全局关键词"])
+        self.assertEqual(task_config["_collection_options"]["platforms"]["boss"]["cities"], ["上海"])
+        self.assertNotIn("target_count", task_config["_collection_options"]["platforms"]["boss"])
+        self.assertTrue(task_config["_collection_options"]["auto_score"])
+
+    def test_full_task_rejects_collection_only_platform_from_saved_config(self):
+        config = {
+            "search": {"keywords": ["人力"], "cities": ["深圳"]},
+            "profile": {"resume_path": "C:/resume.md"},
+            "ai": {"api_key": "test-key"},
+            "collection": {"default_order": ["boss", "zhilian"]},
+            "platforms": {
+                "boss": {"enabled": True, "search": {"keywords": ["人力"], "cities": ["深圳"]}},
+                "zhilian": {"enabled": True, "search": {"keywords": ["人力"], "cities": ["深圳"]}},
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
+            server, "platform_supports", side_effect=lambda plat, cap: False if plat == "zhilian" and cap == "deliver" else True
+        ), patch.object(
+            server.task_runner, "start", return_value={"id": "full-with-zhilian"}
+        ) as start:
+            status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "full"})
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body)["collection_only_platforms"], ["zhilian"])
+        start.assert_not_called()
+
+    def test_full_task_rejects_collection_only_platform_from_dialog(self):
+        config = {
+            "profile": {"resume_path": "C:/resume.md"},
+            "ai": {"api_key": "test-key"},
+            "collection": {"default_order": ["boss"]},
+            "platforms": {
+                "boss": {"enabled": True, "search": {}},
+                "zhilian": {"enabled": False, "search": {}},
+            },
+        }
+        options = {
+            "platform_order": ["zhilian"],
+            "auto_score": False,
+            "platforms": {
+                "zhilian": {
+                    "keywords": ["人力"],
+                    "cities": ["深圳"],
+                    "city_codes": {"深圳": "765"},
+                    "max_pages": 3,
+                    "sort": "default",
+                    "target_count": 3,
+                },
+            },
+        }
+        with patch.object(server, "load_config", return_value=config), patch.object(server, "_preflight_messages", return_value=[]), patch.object(
+            server, "platform_supports", side_effect=lambda plat, cap: False if plat == "zhilian" and cap == "deliver" else True
+        ), patch.object(
+            server, "_write_config"
+        ) as write_config, patch.object(server.task_runner, "start", return_value={"id": "full-dialog-options"}) as start:
+            status, _, body = self._request(
+                "/api/workbench/task",
+                method="POST",
+                json_body={"mode": "full", "options": options},
+            )
+
+        self.assertTrue(status.startswith("400"), body)
+        self.assertEqual(json.loads(body)["collection_only_platforms"], ["zhilian"])
+        start.assert_not_called()
+        write_config.assert_not_called()
+
+    def _seed_scoring_base(self, base_dir: Path):
+        (base_dir / "config.yaml").write_text(
+            yaml.dump({"ai": {"api_key": "test-api-key"}}, allow_unicode=True),
+            encoding="utf-8",
+        )
+        server.set_base_dir(base_dir)
+        db = get_db(server.DATA_DIR / "allin.db")
+        try:
+            insert_job(db, _job("p1"))
+        finally:
+            db.close()
+
+    def _seed_run(self, run_id: str, status: str):
+        db_path = server.DATA_DIR / "allin.db"
+        create_scoring_run(
+            db_path,
+            run_id=run_id,
+            options={"scope": "pending", "limit": None, "force_rescore": False},
+            job_ids=["p1"],
+        )
+        update_scoring_run(db_path, run_id, status=status, pause_reason="AI 服务请求失败" if status == "paused" else None)
+
+    def test_scoring_start_reports_paused_run_with_machine_readable_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-paused", "paused")
+
+            with patch.object(server, "_preflight_messages", return_value=[]):
+                status, _, body = self._request(
+                    "/api/scoring/start",
+                    method="POST",
+                    json_body={"options": {"scope": "pending", "limit": None, "job_ids": [], "force_rescore": False}},
+                )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertEqual(payload.get("code"), "scoring_run_paused")
+        self.assertIn("强制开始新任务", payload["error"])
+
+    def test_scoring_start_ignores_non_boolean_force_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-paused", "paused")
+            runner = MagicMock()
+
+            for bad_force in ("false", "true", 1):
+                with patch.object(server, "_preflight_messages", return_value=[]), patch.object(server, "task_runner", runner):
+                    status, _, body = self._request(
+                        "/api/scoring/start",
+                        method="POST",
+                        json_body={
+                            "force": bad_force,
+                            "options": {"scope": "pending", "limit": None, "job_ids": [], "force_rescore": False},
+                        },
+                    )
+
+                payload = json.loads(body)
+                self.assertTrue(status.startswith("409"), body)
+                self.assertEqual(payload.get("code"), "scoring_run_paused")
+
+            old_run = get_scoring_run(server.DATA_DIR / "allin.db", "run-paused")
+            self.assertEqual(old_run["status"], "paused")
+            runner.start.assert_not_called()
+
+    def test_scoring_start_with_force_ends_paused_run_and_starts_new(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-paused", "paused")
+            runner = MagicMock()
+            runner.start.return_value = {"id": "task-1", "status": "running"}
+
+            with patch.object(server, "_preflight_messages", return_value=[]), patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/scoring/start",
+                    method="POST",
+                    json_body={
+                        "force": True,
+                        "options": {"scope": "pending", "limit": None, "job_ids": [], "force_rescore": False},
+                    },
+                )
+
+            payload = json.loads(body)
+            old_run = get_scoring_run(server.DATA_DIR / "allin.db", "run-paused")
+            self.assertTrue(status.startswith("200"), body)
+            self.assertEqual(old_run["status"], "stopped")
+            self.assertIn("强制结束", old_run["error"])
+            self.assertEqual(payload["run"]["status"], "running")
+            self.assertNotEqual(payload["run"]["id"], "run-paused")
+            runner.start.assert_called_once()
+
+    def test_scoring_start_with_force_still_rejects_active_running_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-active", "running")
+            runner = MagicMock()
+
+            with patch.object(server, "_preflight_messages", return_value=[]), patch.object(server, "task_runner", runner):
+                status, _, body = self._request(
+                    "/api/scoring/start",
+                    method="POST",
+                    json_body={
+                        "force": True,
+                        "options": {"scope": "pending", "limit": None, "job_ids": [], "force_rescore": False},
+                    },
+                )
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("409"), body)
+        self.assertIn("正在运行", payload["error"])
+        runner.start.assert_not_called()
+
+    def test_score_checkpoint_writes_error_for_ai_pause_but_not_user_pause(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_scoring_base(Path(tmp))
+            self._seed_run("run-checkpoint", "running")
+            task = WorkbenchTask(id="task-ckpt", mode="score", label="单独 AI 评分")
+            ai_pause = "AI 服务请求失败 (request_failed, status=404)"
+            states = [
+                {"remaining_job_ids": ["p1"], "status": "paused", "pause_reason": ai_pause, "error": ai_pause},
+                {"remaining_job_ids": ["p1"], "status": "paused", "pause_reason": "用户暂停或任务中断", "error": ""},
+            ]
+
+            def fake_score_jobs(config, *args, **kwargs):
+                callback = config.get("_workbench_score_checkpoint")
+                for state in states:
+                    callback(dict(state))
+
+            with patch("allin.ai.scorer.score_jobs", side_effect=fake_score_jobs), patch.object(
+                server, "update_scoring_run", return_value=None
+            ) as update_run:
+                server._execute_score(task, {"_score_run_id": "run-checkpoint", "_score_options": {}})
+
+            paused_calls = [call for call in update_run.call_args_list if call.kwargs.get("status") == "paused"]
+            self.assertEqual(paused_calls[0].kwargs.get("error"), ai_pause)
+            self.assertEqual(paused_calls[1].kwargs.get("error"), None)
+            self.assertEqual(task.error, ai_pause)
+            self.assertTrue(task.stop_requested.is_set())
+
+    def test_web_api_resume_retry_success_marks_needs_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("resume-retry-ok"))
+                add_history(db, "resume-retry-ok", "resume_failed", json.dumps({"schema": "resume_failed.v2", "system_reason": "fail"}))
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = ?",
+                    ("resume-retry-ok", "resume_failed"),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+            fake_resume = base_dir / "data" / "resumes" / "retry.pdf"
+            fake_resume.parent.mkdir(parents=True, exist_ok=True)
+            fake_resume.write_text("pdf", encoding="utf-8")
+            with patch("allin.ai.resume.generate_tailored_resume", return_value=fake_resume):
+                status, _, body = self._request(f"/api/history/{history_id}/resume-retry", method="POST", json_body={})
+            self.assertTrue(status.startswith("200"), body)
+            payload = json.loads(body)
+            self.assertTrue(payload["success"])
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                job_status = verify_db.execute("SELECT status FROM jobs WHERE id = ?", ("resume-retry-ok",)).fetchone()["status"]
+                actions = [row["action"] for row in verify_db.execute("SELECT action FROM history WHERE job_id = ?", ("resume-retry-ok",)).fetchall()]
+            finally:
+                verify_db.close()
+            self.assertEqual(job_status, "needs_resume")
+            self.assertIn("needs_resume", actions)
+
+    def test_web_api_resume_retry_does_not_overwrite_replied_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("resume-retry-replied"))
+                update_job_status(db, "resume-retry-replied", "replied")
+                add_history(db, "resume-retry-replied", "resume_failed", json.dumps({"schema": "resume_failed.v2", "system_reason": "fail"}))
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = ?",
+                    ("resume-retry-replied", "resume_failed"),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+            fake_resume = base_dir / "data" / "resumes" / "retry.pdf"
+            fake_resume.parent.mkdir(parents=True, exist_ok=True)
+            fake_resume.write_text("pdf", encoding="utf-8")
+            with patch("allin.ai.resume.generate_tailored_resume", return_value=fake_resume):
+                status, _, body = self._request(f"/api/history/{history_id}/resume-retry", method="POST", json_body={})
+            self.assertTrue(status.startswith("200"), body)
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                job_status = verify_db.execute("SELECT status FROM jobs WHERE id = ?", ("resume-retry-replied",)).fetchone()["status"]
+            finally:
+                verify_db.close()
+            self.assertEqual(job_status, "replied")
+
+    def test_web_api_resume_retry_failure_writes_resume_failed_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("resume-retry-fail"))
+                add_history(db, "resume-retry-fail", "resume_failed", json.dumps({"schema": "resume_failed.v2", "system_reason": "old"}))
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = ?",
+                    ("resume-retry-fail", "resume_failed"),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+            with patch("allin.ai.resume.generate_tailored_resume", return_value=None), patch(
+                "allin.ai.resume.get_last_resume_failure_reason", return_value="test failure"
+            ):
+                status, _, body = self._request(f"/api/history/{history_id}/resume-retry", method="POST", json_body={})
+            self.assertTrue(status.startswith("400"), body)
+            self.assertIn("test failure", body)
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                failed_count = verify_db.execute(
+                    "SELECT COUNT(*) AS cnt FROM history WHERE job_id = ? AND action = ?",
+                    ("resume-retry-fail", "resume_failed"),
+                ).fetchone()["cnt"]
+            finally:
+                verify_db.close()
+            self.assertGreaterEqual(failed_count, 2)
+
+    def test_web_api_resume_dismiss_removes_failure_from_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "allin.db")
+            try:
+                insert_job(db, _job("resume-dismiss-test"))
+                add_history(db, "resume-dismiss-test", "resume_failed", json.dumps({"schema": "resume_failed.v2", "system_reason": "fail"}))
+                history_id = db.execute(
+                    "SELECT id FROM history WHERE job_id = ? AND action = ?",
+                    ("resume-dismiss-test", "resume_failed"),
+                ).fetchone()["id"]
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+            status, _, body = self._request(f"/api/history/{history_id}/resume-dismiss", method="POST", json_body={})
+            self.assertTrue(status.startswith("200"), body)
+            verify_db = get_db(base_dir / "data" / "allin.db")
+            try:
+                actions = [row["action"] for row in verify_db.execute("SELECT action FROM history WHERE job_id = ? ORDER BY id", ("resume-dismiss-test",)).fetchall()]
+                unresolved = get_unresolved_resume_failures(verify_db)
+            finally:
+                verify_db.close()
+            self.assertIn("resume_failed_dismissed", actions)
+            self.assertNotIn("resume-dismiss-test", [row["job_id"] for row in unresolved])
+
+    def test_outreach_resume_can_be_read_and_explicitly_reviewed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server.set_base_dir(root)
+            source_path = root / "data" / "resumes" / "job-review.md"
+            image_path = root / "data" / "resumes" / "job-review.png"
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_text("# 候选人\n\n## 教育经历\n本科\n", encoding="utf-8")
+            image_path.write_bytes(b"png")
+            db = get_db(root / "data" / "allin.db")
+            try:
+                insert_job(db, _job("job-review"))
+                db.execute(
+                    """
+                    UPDATE jobs
+                    SET resume_source_path = ?, resume_image_path = ?,
+                        resume_review_status = 'needs_review', resume_generation_source = 'deepseek'
+                    WHERE id = ?
+                    """,
+                    (str(source_path), str(image_path), "job-review"),
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            status, _, body = self._request("/api/jobs/job-review/outreach-resume")
+            self.assertTrue(status.startswith("200"), body)
+            payload = json.loads(body)
+            self.assertEqual(payload["status"], "needs_review")
+            self.assertEqual(payload["source"], "deepseek")
+            self.assertIn("教育经历", payload["markdown"])
+            self.assertNotIn(str(source_path), body)
+
+            status, _, body = self._request(
+                "/api/jobs/job-review/outreach-resume/review",
+                method="POST",
+                json_body={"confirmed": True},
+            )
+            self.assertTrue(status.startswith("200"), body)
+            self.assertEqual(json.loads(body)["status"], "ready")
+
+            db = get_db(root / "data" / "allin.db")
+            try:
+                row = db.execute(
+                    "SELECT resume_review_status, resume_reviewed_at FROM jobs WHERE id = ?",
+                    ("job-review",),
+                ).fetchone()
+            finally:
+                db.close()
+            self.assertEqual(row["resume_review_status"], "ready")
+            self.assertIsNotNone(row["resume_reviewed_at"])
+
+    def test_greeting_selection_during_send_cannot_change_sent_text(self):
+        from allin.executor.sender import send_greetings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db_path = base_dir / "data" / "allin.db"
+            db = get_db(db_path)
+            insert_job(db, _job("send-snapshot"))
+            update_job_status(db, "send-snapshot", "ready")
+            update_job_greeting(db, "send-snapshot", "已经确认的发送文本")
+            db.close()
+            server.set_base_dir(base_dir)
+            result = {}
+
+            def edit_during_send(message):
+                if result:
+                    return
+                status, _, body = self._request(
+                    "/api/jobs/send-snapshot/greeting-selection", method="POST",
+                    json_body={"selection": "edited", "greeting": "发送中尝试改写", "confirmed": True},
+                )
+                result["edit_status"] = status
+                result["edit_body"] = json.loads(body)
+
+            def fake_send(job, greeting, config):
+                result["sent_text"] = greeting
+                return {"success": True}, None
+
+            with (
+                patch("allin.db.DB_PATH", db_path),
+                patch.object(server.task_runner, "status", return_value={
+                    "active": {"id": "sending", "mode": "deliver", "status": "running"},
+                }),
+                patch("allin.executor.sender.should_take_day_off", return_value=False),
+                patch("allin.executor.sender.SendWindowChecker.is_active", return_value=True),
+                patch("allin.executor.sender._send_greeting_once", side_effect=fake_send),
+            ):
+                send_greetings({"_workbench_log": edit_during_send, "throttle": {"daily_limit": 10}})
+            db = get_db(db_path)
+            try:
+                row = db.execute("SELECT greeting, status FROM jobs WHERE id = 'send-snapshot'").fetchone()
+                self.assertTrue(result["edit_status"].startswith("409"), result)
+                self.assertEqual(result["edit_body"]["code"], "greeting_edit_busy")
+                self.assertEqual(result["sent_text"], "已经确认的发送文本")
+                self.assertEqual(dict(row), {"greeting": result["sent_text"], "status": "sent"})
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM history WHERE action = 'greeting_selected'").fetchone()[0], 0)
+            finally:
+                db.close()
+
+    def test_detail_edit_confirms_preview_and_cannot_be_regenerated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db_path = base_dir / "data" / "allin.db"
+            db = get_db(db_path)
+            insert_job(db, _job("edited-preview"))
+            update_job_status(db, "edited-preview", "approved")
+            self.assertTrue(save_generated_greeting_preview(
+                db, "edited-preview", original="原文", optimized="优化文案", style_issues=["建议"],
+                selected_greeting="原文", selection="pending", expected_status="approved",
+            ))
+            db.close()
+            server.set_base_dir(base_dir)
+            with patch.object(server.task_runner, "status", return_value={"active": None}):
+                status, _, _ = self._request(
+                    "/api/jobs/edited-preview/greeting", method="POST",
+                    json_body={"greeting": "手动最终版本"},
+                )
+                self.assertTrue(status.startswith("400"))
+                status, _, body = self._request(
+                    "/api/jobs/edited-preview/greeting", method="POST",
+                    json_body={"greeting": "手动最终版本", "confirmed": True},
+                )
+                self.assertTrue(status.startswith("200"), body)
+            with patch.object(server.task_runner, "start") as start:
+                status, _, body = self._request(
+                    "/api/workbench/greetings", method="POST",
+                    json_body={"job_ids": ["edited-preview"], "regenerate": True},
+                )
+                self.assertTrue(status.startswith("409"), body)
+                self.assertEqual(json.loads(body)["code"], "greeting_reviewed")
+                start.assert_not_called()
+            db = get_db(db_path)
+            try:
+                row = dict(db.execute("SELECT * FROM jobs WHERE id = 'edited-preview'").fetchone())
+                self.assertEqual(row["greeting"], "手动最终版本")
+                self.assertEqual(row["greeting_selection"], "edited")
+                self.assertIsNotNone(row["greeting_reviewed_at"])
+                self.assertEqual(row["greeting_original"], "原文")
+                self.assertEqual(row["greeting_optimized"], "优化文案")
+                self.assertFalse(save_generated_greeting_preview(
+                    db, "edited-preview", original="后台新草稿", optimized=None, style_issues=[],
+                    selected_greeting="后台新草稿", selection="generated",
+                    expected_greeting="手动最终版本", expected_status="ready",
+                ))
+                self.assertEqual(get_jobs_ready_to_send(db)[0]["greeting"], "手动最终版本")
+            finally:
+                db.close()
+
+    def test_preview_generation_does_not_revive_or_overwrite_changed_job(self):
+        from allin.ai.greeter import generate_greetings
+
+        for change in ("edited", "error", "sent", "deleted"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                db_path = Path(tmp) / "data" / "allin.db"
+                db = get_db(db_path)
+                insert_job(db, _job("changed-during-ai"))
+                update_job_status(db, "changed-during-ai", "approved")
+                db.close()
+
+                def fake_ai(*args, **kwargs):
+                    current = get_db(db_path)
+                    try:
+                        if change == "edited":
+                            edit_job_greeting(current, "changed-during-ai", "人工最终文案", expected_status="approved")
+                        elif change == "deleted":
+                            current.execute("UPDATE jobs SET deleted_at = CURRENT_TIMESTAMP WHERE id = 'changed-during-ai'")
+                            current.commit()
+                        else:
+                            update_job_status(current, "changed-during-ai", change)
+                    finally:
+                        current.close()
+                    return "后台生成的草稿"
+
+                config = {"ai": {"greeting_max_iterations": 0}}
+                with (
+                    patch("allin.ai.greeter._get_resume_summary", return_value="真实简历摘要"),
+                    patch("allin.ai.greeter._call_claude", side_effect=fake_ai),
+                ):
+                    self.assertEqual(generate_greetings(config, job_ids=["changed-during-ai"], db_path=db_path), 0)
+                self.assertEqual(config["_workbench_greeting_report"]["conflict_ids"], ["changed-during-ai"])
+                db = get_db(db_path)
+                try:
+                    row = dict(db.execute("SELECT * FROM jobs WHERE id = 'changed-during-ai'").fetchone())
+                    self.assertEqual(row["greeting"], "人工最终文案" if change == "edited" else None)
+                    self.assertEqual(row["status"], change if change in {"sent", "error"} else "approved")
+                    self.assertIsNone(row["greeting_original"])
+                    if change == "deleted":
+                        self.assertIsNotNone(row["deleted_at"])
+                finally:
+                    db.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

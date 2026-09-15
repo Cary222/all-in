@@ -1,0 +1,166 @@
+# All In 配置文件
+# 复制此文件为 config.yaml 并修改为你的实际配置
+
+profile:
+  resume_path: "./resume.md"
+  # 用于校招/社招岗位筛选与 AI 评分；留空保持旧行为。
+  education: ""
+  recruitment_type: ""  # campus / experienced / both
+  greeting_preference: ""  # 只补充招呼语语气与内容偏好，不覆盖事实和安全规则
+  resume_output_dir: "./data/resumes"
+  target_roles: ["你的目标岗位1", "目标岗位2", "目标岗位3"]
+  target_cities: ["北京"]
+  salary_min: 15  # K
+  salary_max: 25  # K
+  salary_ceil_ratio: 1.5  # 岗位薪资下限超过 salary_max × 该倍数时过滤
+  filter_unparsed_salary: true  # 过滤面议或无法解析薪资的岗位
+  allow_internship: false
+  deal_breakers: ["外包", "996"]
+  jd_deal_breakers: []  # 示例：需要排除完整 JD 中的词时再填写
+  blocked_companies: [] # 示例：不希望采集的公司名称或关键词
+  # 可选：个人亮点（用于招呼语生成）
+  extra_highlights:
+    - "你的核心竞争力描述"
+  # 可选：在线作品集链接
+  portfolio_url: ""
+
+search:
+  keywords: ["关键词1", "关键词2"]
+  cities: ["北京"]
+  city_codes: {}  # 自定义城市名称 -> 平台城市编码，由配置页自动填写
+  max_pages: 5
+  sort: newest
+
+collection:
+  default_order: [boss]
+  auto_score_default: false
+  # 以下页面额度只统计 BOSS 直聘；智联和 51job 不占用。
+  daily_search_page_limit: 60     # BOSS 单日搜索页上限
+  daily_detail_page_limit: 150    # BOSS 单日详情页尝试上限
+  max_consecutive_page_failures: 3
+  risk_pause_min_minutes: 5       # BOSS 风险信号后随机暂停下限
+  risk_pause_max_minutes: 10      # BOSS 风险信号后随机暂停上限
+  collection_delay_multiplier: 1.5 # BOSS 采集等待时间倍数
+  delivery_cooldown_min_minutes: 5   # BOSS 采集结束到 BOSS 投递的随机冷却下限
+  delivery_cooldown_max_minutes: 15  # BOSS 采集结束到 BOSS 投递的随机冷却上限
+
+platforms:
+  boss:
+    enabled: true
+    search:
+      keywords: ["关键词1", "关键词2"]
+      cities: ["北京"]
+      city_codes: {}
+      max_pages: 5
+      sort: newest
+  zhilian:
+    enabled: false
+    search:
+      keywords: []
+      cities: []
+      # 只需填写城市名称；All In 会从内置智联目录自动匹配城市编码。
+      city_codes: {}
+      max_pages: 3
+      sort: default
+      # 断点续采有效期（小时）：有效期内的（城市, 关键词）组合会整词跳过，不重复搜索。
+      # 默认 24；设为 0 表示每次采集都完整重搜（不再跳过任何词）。
+      resume_ttl_hours: 24
+  51job:
+    enabled: false
+    # 51job 目前只开放采集/评分/招呼语生成，真实发送和监听仍锁定。
+    search:
+      keywords: []
+      cities: ["上海"]
+      city_codes: {"上海": "020000"}
+      max_pages: 1
+      sort: default
+      # 断点续采有效期（小时）；0 表示停用，每次完整重搜。
+      resume_ttl_hours: 24
+  liepin:
+    enabled: false
+    # 猎聘目前只开放采集/评分/招呼语生成，真实发送和监听仍锁定。
+    search:
+      keywords: []
+      cities: []
+      # 只需填写城市名称；All In 会从内置猎聘目录自动匹配城市编码。
+      city_codes: {}
+      max_pages: 1
+      sort: default
+      # 断点续采有效期（小时）；0 表示停用，每次完整重搜。
+      resume_ttl_hours: 24
+
+scoring:
+  threshold: 70
+  max_candidates: 20
+
+throttle:
+  daily_limit: 30
+  interval_min: 60
+  interval_max: 180
+  browse_before_greet: true
+  browse_duration_min: 15
+  browse_duration_max: 30
+  send_windows:
+    - "09:00-17:00"
+  day_off_probability: 0.05
+
+ai:
+  provider: "anthropic"
+  service: "anthropic"           # anthropic / deepseek / doubao / custom
+  model: "claude-sonnet-4-6"
+  thinking: "auto"               # auto / disabled / enabled / off
+  thinking_budget: 2048           # thinking=enabled 时使用，至少 1024
+  timeout_seconds: 180
+  scoring_max_tokens: 8192
+  scoring_max_attempts: 2
+  scoring_concurrency: 1          # AI评分并发数，范围1-3；数据库仍串行写入
+  scoring_second_review: false    # 可选：对68-79分临界岗位进行一次独立复核
+  greeting_max_tokens: 8192
+  greeting_review_max_tokens: 4096
+  greeting_max_attempts: 2
+  # 可选：为不同任务覆盖通用 thinking 与超时设置
+  # scoring_thinking_mode: "enabled"
+  # scoring_timeout_seconds: 180
+  # greeting_thinking_mode: "auto"
+  # greeting_timeout_seconds: 180
+  greeting_review_threshold: 7
+  greeting_max_iterations: 2
+  greeting_style_suggestions: true  # 生成原文与优化预览；关闭后只保留首次生成结果
+  greeting_auto_apply_style: false  # 默认不自动替换，需在页面选择原文或优化版
+  resume_max_pages: 3
+  # 建议在本地面板填写 api_key；它会单独保存在忽略提交的本地凭据文件中，不写入 config.yaml
+  # base_url 填写后优先生效；留空时才读取对应环境变量或使用服务商默认地址
+  # （ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / ARK_API_KEY / OPENAI_API_KEY）
+  # api_key: "your-api-key"
+  # base_url: "https://api.anthropic.com"
+
+monitor:
+  interval: 30
+  # 仅“运行全流程”发送结束后生效；单独监测会立即执行首轮
+  initial_cooldown_minutes: 10
+  chat_url: "https://www.zhipin.com/web/geek/chat"
+  max_conversations_per_cycle: 5
+  max_consecutive_page_failures: 3
+  max_resume_sends_per_cycle: 5
+  auto_reply_hr_questions: false
+
+follow_up:
+  enabled: false
+  interval_hours: 30
+  skip_weekends: true
+
+dedup:
+  history_file: "./data/history.jsonl"
+
+safety:
+  daily_platform_page_limit: 500  # 仅 BOSS：采集、投递和监测合计的页面打开硬上限
+  risk_lock_minutes: 10           # 旧版 24 小时锁已取消；投递/监测风险最多短时冷却
+
+browser:
+  runtime: "builtin"
+  proxy_host: "127.0.0.1"
+  proxy_port: 3456
+  chrome_ports: [9222, 9229, 9333]
+  auto_start_proxy: true
+  enable_port_guard: true
+  site_patterns: true

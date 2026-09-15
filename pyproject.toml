@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "allin"
+version = "2.4.0"
+description = "All In - 多平台智能求职 Agent，端到端自动化投递工具"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+    "httpx>=0.27",
+    "patchright>=1.58.2",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+    "anthropic>=0.40",
+    "markdown2>=2.4",
+    "bottle>=0.13",
+    "openpyxl>=3.1",
+    "pypdf>=5.0",
+]
+
+[project.optional-dependencies]
+pdf = [
+    "xhtml2pdf>=0.2.11",
+]
+
+[project.scripts]
+allin = "allin.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/allin"]
+artifacts = [
+    "src/allin/browser/runtime/*.mjs",
+    "src/allin/browser/runtime/site-patterns/*.md",
+    "src/allin/data/*.json",
+]
+
+# The frontend build output is no longer tracked in VCS (built on demand),
+# so it must be force-included to ship inside the wheel. Run
+# `npm ci && npm run build` in src/allin/web/frontend before building.
+[tool.hatch.build.targets.wheel.force-include]
+"src/allin/web/frontend/dist" = "allin/web/frontend/dist"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+
+[tool.ruff.format]
+indent-style = "tab"
