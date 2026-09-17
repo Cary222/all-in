@@ -8,7 +8,7 @@ from threading import Event
 from unittest import TestCase
 from unittest.mock import MagicMock, Mock, patch
 
-from allin.db import get_db, insert_job
+from allin.db import count_sent_today, get_db, insert_job
 from allin.executor.sender import (
     BaseSender,
     BossSender,
@@ -329,6 +329,147 @@ class SendGreetingsDispatchTests(TestCase):
             result = send_greetings(config, db_path=self.db_path)
             mock_send.assert_called_once()
             self.assertEqual(result, 1)
+
+    def test_already_delivered_greeting_records_without_consuming_quota(self):
+        """A greeting already present in the conversation must not burn today's quota.
+
+        The bubble proves an earlier run delivered it, so this run did not send
+        anything. It is recorded via ``manual_sent`` (the action used for
+        out-of-band sends) purely for visibility, and ``count_sent_today`` — which
+        only counts ``sent`` — must stay at zero.
+        """
+        _seed_db(self.db_path, [
+            _make_job("lp-1", "liepin", "你好猎聘", score=80),
+        ])
+        db = get_db(self.db_path)
+        try:
+            before = count_sent_today(db, platform="liepin")
+        finally:
+            db.close()
+
+        already_delivered = json.dumps({
+            "success": True,
+            "verified": True,
+            "already_sent": True,
+            "status_text": "ai_greeting_already_delivered",
+            "sent_message": "你好猎聘",
+        })
+        config = {
+            "_workbench_job_ids": ["lp-1"],
+            "throttle": {"daily_limit": 10, "interval_min": 0, "interval_max": 0},
+        }
+        with patch("allin.executor.sender.evaluate", return_value=already_delivered):
+            send_greetings(config, db_path=self.db_path, platform="liepin")
+
+        db = get_db(self.db_path)
+        try:
+            after = count_sent_today(db, platform="liepin")
+            job = db.execute("SELECT status FROM jobs WHERE id = 'lp-1'").fetchone()
+            actions = [
+                row["action"]
+                for row in db.execute(
+                    "SELECT action FROM history WHERE job_id = 'lp-1' ORDER BY id"
+                ).fetchall()
+            ]
+        finally:
+            db.close()
+
+        self.assertEqual(before, 0)
+        self.assertEqual(after, 0, "already-delivered greeting must not count as sent today")
+        self.assertEqual(job["status"], "sent")
+        self.assertIn("manual_sent", actions)
+        self.assertNotIn("sent", actions)
+
+    def test_page_limit_stop_does_not_mark_job_as_error(self):
+        """A platform page-budget stop must not be recorded as a per-job failure.
+
+        Hitting the daily platform-page budget or an active risk cooldown means the
+        job was never attempted — the job itself is fine. It must stop the run
+        without flipping the job to `error`, without counting a failure, and without
+        burning a backoff cycle.
+        """
+        _seed_db(self.db_path, [
+            _make_job("lp-limit", "liepin", "你好猎聘", score=80),
+        ])
+        config = {
+            "_workbench_job_ids": ["lp-limit"],
+            "throttle": {"daily_limit": 10, "interval_min": 0, "interval_max": 0},
+        }
+        limit_result = json.dumps({
+            "success": False,
+            "error": "daily_platform_page_limit",
+            "history_detail": "为了账户安全，已达到平台页面访问上限",
+        })
+        with patch("allin.executor.sender.evaluate", return_value=limit_result):
+            send_greetings(config, db_path=self.db_path, platform="liepin")
+
+        report = config.get("_workbench_send_report", {})
+        db = get_db(self.db_path)
+        try:
+            job = db.execute("SELECT status, last_error_code FROM jobs WHERE id = 'lp-limit'").fetchone()
+            actions = [
+                row["action"]
+                for row in db.execute(
+                    "SELECT action FROM history WHERE job_id = 'lp-limit' ORDER BY id"
+                ).fetchall()
+            ]
+        finally:
+            db.close()
+
+        self.assertEqual(report.get("stop_reason"), "daily_platform_page_limit")
+        self.assertEqual(report.get("failed_count"), 0)
+        self.assertNotEqual(job["status"], "error")
+        self.assertNotIn("error", actions)
+
+    def test_risk_lock_stop_does_not_mark_job_as_error(self):
+        """An active risk cooldown is likewise a safety stop, not a job failure."""
+        _seed_db(self.db_path, [
+            _make_job("zl-lock", "zhilian", "你好智联", score=80),
+        ])
+        config = {
+            "_workbench_job_ids": ["zl-lock"],
+            "throttle": {"daily_limit": 10, "interval_min": 0, "interval_max": 0},
+        }
+        lock_result = json.dumps({
+            "success": False,
+            "error": "persistent_risk_lock",
+            "history_detail": "仍在风险冷却中",
+        })
+        with patch("allin.executor.sender.evaluate", return_value=lock_result):
+            send_greetings(config, db_path=self.db_path, platform="zhilian")
+
+        report = config.get("_workbench_send_report", {})
+        db = get_db(self.db_path)
+        try:
+            job = db.execute("SELECT status FROM jobs WHERE id = 'zl-lock'").fetchone()
+        finally:
+            db.close()
+
+        self.assertEqual(report.get("stop_reason"), "persistent_risk_lock")
+        self.assertEqual(report.get("failed_count"), 0)
+        self.assertNotEqual(job["status"], "error")
+
+    def test_boss_daily_limit_is_not_silently_clamped(self):
+        """The configured daily limit must be honoured, not clamped to 50.
+
+        An earlier refactor clamped BOSS to 50 while `config_schema.json` allows up
+        to 200, so a saved value above 50 was silently ignored and the workbench
+        quota no longer matched what was actually sent.
+        """
+        _seed_db(self.db_path, [
+            _make_job("boss-limit", "boss", "你好boss", score=80),
+        ])
+        config = {
+            "_workbench_job_ids": ["boss-limit"],
+            "throttle": {"daily_limit": 303, "interval_min": 0, "interval_max": 0},
+        }
+        with patch("allin.executor.sender.evaluate", return_value=json.dumps({
+            "success": True, "verified": True,
+        })):
+            send_greetings(config, db_path=self.db_path, platform="boss")
+
+        report = config.get("_workbench_send_report", {})
+        self.assertEqual(report.get("daily_limit"), 303)
 
 
 # ---------------------------------------------------------------------------

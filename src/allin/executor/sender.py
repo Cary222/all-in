@@ -31,6 +31,13 @@ from allin.platform_safety import PlatformAccessGuard, PlatformSafetyStop
 
 console = Console()
 
+
+def _safe_console_print(msg: str) -> None:
+    try:
+        console.print(msg)
+    except Exception:
+        pass
+
 CHAT_BUTTON_SELECTOR = (
     'a[redirect-url*="/web/geek/chat"], '
     'a[data-url*="/friend/add"], '
@@ -934,7 +941,11 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
         "startchat_redirected",
         "continue_chat_confirmed",
     }:
-        console.print("[yellow]    ! 沟通按钮未跳转聊天页，尝试真实点击兜底[/yellow]")
+        workbench_log = throttle_config.get("_workbench_log")
+        if callable(workbench_log):
+            workbench_log("    ! 沟通按钮未跳转聊天页，尝试真实点击兜底")
+        else:
+            _safe_console_print("[yellow]    ! 沟通按钮未跳转聊天页，尝试真实点击兜底[/yellow]")
         if click_at(target_id, CHAT_BUTTON_SELECTOR):
             if _sleep_or_stop(1, stop_event):
                 close_tab(target_id)
@@ -1328,6 +1339,52 @@ def _send_zhilian_greeting_once(
             return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
         };
 
+        // 智联可能在投递过程中弹出简历选择框（账号内有多份在线简历时）。
+        // 必须先选定简历再让流程继续，否则会把不确定的简历投给 HR。
+        const pickerSelectors = [
+            '.resume-select-box', '.resume-select', '[class*="resume-select"]',
+            '[class*="resumeSelect"]', '[class*="choose-resume"]', '[class*="resume-choose"]'
+        ];
+        let picker = null;
+        for (const sel of pickerSelectors) {
+            picker = Array.from(document.querySelectorAll(sel)).find(isVisible);
+            if (picker) break;
+        }
+        if (!picker) {
+            // 兜底：带“选择简历/请选择简历”文案的可见弹窗
+            const dialogs = Array.from(document.querySelectorAll(
+                '[role="dialog"], [class*="dialog"], [class*="modal"]'
+            )).filter(isVisible);
+            picker = dialogs.find(d => /招聘者可见的简历|选择简历|请选择.*简历/.test(normalize(d.innerText))) || null;
+        }
+        if (picker) {
+            const items = Array.from(picker.querySelectorAll(
+                '[class*="item"], [class*="card"], li, label'
+            )).filter(isVisible);
+            const wanted = normalize(__WANTED_RESUME__);
+            const matched = wanted
+                ? items.find(item => normalize(item.innerText).includes(wanted))
+                : null;
+            if (matched) {
+                const clickable = matched.querySelector('input[type="radio"], a, button') || matched;
+                clickable.click();
+                return JSON.stringify({
+                    success: true,
+                    verified: false,
+                    step: 'resume_selected',
+                    selected: normalize(matched.innerText).slice(0, 40)
+                });
+            }
+            return JSON.stringify({
+                success: false,
+                error: 'zhilian_resume_picker_unresolved',
+                history_detail: wanted
+                    ? `智联弹出简历选择框，但未找到与“${wanted}”匹配的简历，已停止以免投递错误简历`
+                    : '智联弹出简历选择框，但未指定目标简历，已停止以免投递错误简历',
+                skip_backoff: true
+            });
+        }
+
         const successModal = document.querySelector('.deliver-greeting-modal');
         if (
             isVisible(successModal) &&
@@ -1355,11 +1412,17 @@ def _send_zhilian_greeting_once(
         return JSON.stringify({success: true, verified: false, status_text: 'waiting'});
     })()
     """
+    # 目标简历名来自岗位的简历匹配结果；为空表示未指定，遇到选择框时按失败关闭处理。
+    wanted_resume = str(job.get("matched_resume_name") or "").strip()
+    status_js = status_js.replace("__WANTED_RESUME__", json.dumps(wanted_resume, ensure_ascii=False))
     status_attempts = max(int(throttle_config.get("_zhilian_status_attempts", 8)), 1)
     status_res: dict = {}
     for attempt in range(status_attempts):
         status_res = _parse_js_result(evaluate(target_id, status_js))
-        if status_res.get("verified"):
+        # Keep polling while the page is merely transient (e.g. a resume picker we
+        # just confirmed), and stop as soon as we have a verdict: verified, or a
+        # hard error such as an unresolved resume picker.
+        if status_res.get("verified") or status_res.get("error"):
             break
         if attempt + 1 < status_attempts and _sleep_or_stop(0.75, stop_event):
             close_tab(target_id)
@@ -1371,6 +1434,10 @@ def _send_zhilian_greeting_once(
             }, None
 
     close_tab(target_id)
+    # A hard error (e.g. an unresolved resume picker, or the page reporting a
+    # problem) carries its own message and must be surfaced as-is.
+    if status_res.get("error"):
+        return status_res, None
     if status_res.get("verified"):
         return {
             "success": True,
@@ -1846,18 +1913,23 @@ def _send_liepin_greeting_once(
 
     if not click_res.get("success"):
         if click_res.get("error") == "action_button_waiting":
+            # Kept as its own error code rather than folded into `no_action_button`:
+            # "the SPA never rendered the entry point" (page/selector drift or slow
+            # load) is diagnosed differently from "the page rendered but has no such
+            # button" (e.g. the job was withdrawn).
             click_res = {
                 "success": False,
-                "error": "no_action_button",
-                "history_detail": "猎聘岗位页已加载，但等待后仍未找到沟通或应聘按钮",
+                "error": "liepin_action_button_timeout",
+                "history_detail": "猎聘岗位页已加载，但等待后仍未渲染右上角沟通按钮",
                 "skip_backoff": True,
             }
         close_tab(target_id)
         return click_res, None
 
-    if click_res.get("already_sent"):
-        close_tab(target_id)
-        return click_res, None
+    # NOTE: the job-page button text ("聊一聊" / "继续聊") only tells us whether a
+    # conversation exists — never whether OUR AI greeting was delivered there.
+    # So "already sent" cannot be decided at click time; it is decided inside the
+    # chat dialog below, by checking for the greeting bubble before we type.
 
     if _sleep_or_stop(2.0, stop_event):
         close_tab(target_id)
@@ -1869,6 +1941,8 @@ def _send_liepin_greeting_once(
         }, None
 
     greeting_escaped = json.dumps(greeting or "", ensure_ascii=False)
+    company_escaped = json.dumps(str(job.get("company") or "").strip(), ensure_ascii=False)
+    title_escaped = json.dumps(str(job.get("title") or "").strip(), ensure_ascii=False)
     chat_state_js = f"""
     (() => {{
         const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
@@ -1905,6 +1979,25 @@ def _send_liepin_greeting_once(
             return JSON.stringify({{success: true, verified: false, step: 'waiting_chat_dialog'}});
         }}
 
+        // 猎聘同时可能渲染多个会话容器（例如上一次会话的抽屉）。在输入任何内容之前，
+        // 必须确认当前弹窗属于目标岗位，否则会把 AI 招呼语发给另一位 HR。
+        // 注意：目标弹窗可能比残留弹窗稍晚渲染，因此这里只作为一次“未就绪”重试，
+        // 只有轮询始终无法匹配目标岗位时才判定为误发风险并停止。
+        const expectedCompany = {company_escaped};
+        const expectedTitle = {title_escaped};
+        const dialogText = normalize(chatDialog.innerText || '');
+        const identityKnown = !!(expectedCompany || expectedTitle);
+        const identityMatch = (expectedCompany && dialogText.includes(expectedCompany)) ||
+            (expectedTitle && dialogText.includes(expectedTitle));
+        if (identityKnown && !identityMatch) {{
+            return JSON.stringify({{
+                success: true,
+                verified: false,
+                step: 'waiting_target_conversation',
+                identity_mismatch: true
+            }});
+        }}
+
         const sentMessages = Array.from(chatDialog.querySelectorAll(
             '.im-ui-message-item-body.im-ui-message-item-send .im-ui-txt-content .text'
         ));
@@ -1912,11 +2005,42 @@ def _send_liepin_greeting_once(
             normalize(message.innerText || message.textContent) === normalizedGreeting
         );
         if (greetingMessage) {{
+            // The greeting bubble already exists. If we already clicked send during
+            // THIS run the marker is set, so the bubble is the message we just sent;
+            // otherwise it proves a previous run已经送达, and we must not send again.
+            const sentInThisRun = window.__allinPendingLiepinGreeting === normalizedGreeting;
+            if (!sentInThisRun) {{
+                return JSON.stringify({{
+                    success: true,
+                    verified: true,
+                    already_sent: true,
+                    status_text: 'ai_greeting_already_delivered',
+                    sent_message: normalize(greetingMessage.innerText || greetingMessage.textContent)
+                }});
+            }}
             return JSON.stringify({{
                 success: true,
                 verified: true,
                 status_text: 'ai_greeting_message_present',
                 sent_message: normalize(greetingMessage.innerText || greetingMessage.textContent)
+            }});
+        }}
+
+        // FAIL-CLOSED：猎聘会把部分历史消息替换为占位提示（例如“不支持此消息查看，
+        // 请登录猎聘APP查看消息内容”）。此时聊天记录不完整，我们无法证明 AI 招呼语
+        // 是否在早前已经发出。重发会把同一条招呼语再次推给真实 HR，且不可撤回，
+        // 因此这里必须拒绝发送，交由人工在猎聘 APP 中确认。
+        const historyText = normalize(chatDialog.innerText || '');
+        const hiddenHistoryMarkers = [
+            '不支持此消息查看', '登录“猎聘APP”查看消息内容', '登录猎聘APP查看消息内容',
+            '请使用猎聘APP查看', '消息内容暂不支持查看'
+        ];
+        if (hiddenHistoryMarkers.some(marker => historyText.includes(marker))) {{
+            return JSON.stringify({{
+                success: false,
+                error: 'liepin_history_not_readable',
+                history_detail: '猎聘会话历史含不可读消息，无法确认 AI 招呼语是否已送达，已停止发送以免重复打扰',
+                skip_backoff: true
             }});
         }}
 
@@ -1978,10 +2102,25 @@ def _send_liepin_greeting_once(
     if not confirm_res.get("success"):
         return confirm_res, None
     if confirm_res.get("verified"):
+        if confirm_res.get("already_sent"):
+            return {
+                "success": True,
+                "verified": True,
+                "already_sent": True,
+                "history_detail": "猎聘该会话已存在此前发送的 AI 招呼语，未重复发送",
+            }, None
         return {
             "success": True,
             "verified": True,
             "history_detail": "猎聘 AI 招呼语已发送并在消息气泡中验证",
+        }, None
+
+    if confirm_res.get("identity_mismatch"):
+        return {
+            "success": False,
+            "error": "liepin_conversation_mismatch",
+            "history_detail": "猎聘聊天弹窗始终不属于目标岗位，未发送以免误发给其他 HR",
+            "skip_backoff": True,
         }, None
 
     return {
@@ -2064,7 +2203,7 @@ class BaseSender(abc.ABC):
             if workbench_log:
                 workbench_log(msg)
             else:
-                console.print(msg)
+                _safe_console_print(msg)
 
         if _stop_requested(stop_event):
             send_report["stop_reason"] = "stopped"
@@ -2119,9 +2258,11 @@ class BaseSender(abc.ABC):
             db.close()
             return 0
 
+        # The daily limit comes from config only. An earlier refactor silently
+        # clamped BOSS to 50, which contradicted both the config schema
+        # (`throttle.daily_limit` allows up to 200) and the user's saved value,
+        # and it made the workbench quota display disagree with what was sent.
         daily_limit = int(throttle_config.get("daily_limit", 30))
-        if self.platform_name == "boss":
-            daily_limit = min(daily_limit, 50)
 
         interval_min = int(throttle_config.get("interval_min", 60))
         interval_max = int(throttle_config.get("interval_max", 180))
@@ -2200,20 +2341,12 @@ class BaseSender(abc.ABC):
                 _log(f"正在发送: {current_job} ({next_label})")
                 send_report["attempted_count"] += 1
 
-                existing_target_ids = [t["targetId"] for t in get_page_targets() if "targetId" in t]
+                try:
+                    existing_target_ids = [t["targetId"] for t in get_page_targets() if "targetId" in t]
+                except Exception:
+                    existing_target_ids = []
 
-                result_data, cleanup_target_id = self.send_single_job(
-                    job,
-                    greeting,
-                    throttle_config,
-                    stop_event,
-                    existing_target_ids=existing_target_ids,
-                )
-
-                if result_data.get("error") == "no_chat_input" and cleanup_target_id:
-                    _log("[yellow]    ! 未进入具体聊天会话，重新打开岗位页再试一次[/yellow]")
-                    close_tab(cleanup_target_id)
-                    cleanup_target_id = None
+                try:
                     result_data, cleanup_target_id = self.send_single_job(
                         job,
                         greeting,
@@ -2221,6 +2354,35 @@ class BaseSender(abc.ABC):
                         stop_event,
                         existing_target_ids=existing_target_ids,
                     )
+                except Exception as exc:
+                    result_data = {
+                        "success": False,
+                        "error": "unexpected_error",
+                        "history_detail": f"发送异常: {exc}",
+                        "skip_backoff": True,
+                    }
+                    cleanup_target_id = None
+
+                if result_data.get("error") == "no_chat_input" and cleanup_target_id:
+                    _log("[yellow]    ! 未进入具体聊天会话，重新打开岗位页再试一次[/yellow]")
+                    close_tab(cleanup_target_id)
+                    cleanup_target_id = None
+                    try:
+                        result_data, cleanup_target_id = self.send_single_job(
+                            job,
+                            greeting,
+                            throttle_config,
+                            stop_event,
+                            existing_target_ids=existing_target_ids,
+                        )
+                    except Exception as exc:
+                        result_data = {
+                            "success": False,
+                            "error": "unexpected_error",
+                            "history_detail": f"重试异常: {exc}",
+                            "skip_backoff": True,
+                        }
+                        cleanup_target_id = None
                     if result_data.get("error") == "stopped":
                         send_report["stop_reason"] = "stopped"
                         if cleanup_target_id:
@@ -2235,6 +2397,21 @@ class BaseSender(abc.ABC):
                     update_job_last_error(db, job["id"], "")
                     matched_resume = job.get("matched_resume_name")
                     detail_prefix = f"[{matched_resume}] " if matched_resume else ""
+                    if result_data.get("already_sent"):
+                        # The greeting bubble was already present in the conversation,
+                        # so a previous run did deliver it. Record it as `manual_sent`
+                        # (the same action used for out-of-band sends) so it is visible
+                        # in history without consuming today's send quota, and without
+                        # pretending this run sent a new greeting.
+                        add_history(
+                            db,
+                            job["id"],
+                            "manual_sent",
+                            f"{detail_prefix}{greeting[:50]}（会话中已存在，未重复发送）",
+                        )
+                        _log(f"[green]✓ 已送达（跳过重复发送）: {current_job}[/green]")
+                        progress.update(task, advance=1)
+                        continue
                     add_history(db, job["id"], "sent", f"{detail_prefix}{greeting[:50]}")
                     sent_count += 1
                     send_report["sent_count"] = sent_count
@@ -2246,6 +2423,18 @@ class BaseSender(abc.ABC):
                     error = result_data.get("error", "unknown")
                     if error == "stopped":
                         send_report["stop_reason"] = "stopped"
+                        break
+
+                    if error in {"daily_platform_page_limit", "persistent_risk_lock"}:
+                        # Page-budget exhaustion / an active risk cooldown are safety
+                        # stops, not per-job failures: the job itself is fine and was
+                        # never attempted. Stop the whole run without marking the job
+                        # as `error`, without counting a failure and without backoff.
+                        send_report["stop_reason"] = error
+                        _log(
+                            f"[yellow]为了账户安全，{self.platform_name} 已达到平台页面访问上限"
+                            "或仍处于风险冷却，停止投递[/yellow]"
+                        )
                         break
 
                     send_report["failed_count"] += 1
@@ -2436,7 +2625,7 @@ def send_greetings(
         for plat, plat_job_ids in jobs_by_platform.items():
             if not platform_supports(plat, "deliver") or plat not in PLATFORM_SENDERS:
                 send_report.setdefault("unsupported_platform_ids", []).extend(plat_job_ids)
-                console.print(f"[yellow]平台 {plat} 暂未提供投递适配器，跳过 {len(plat_job_ids)} 个岗位[/yellow]")
+                _safe_console_print(f"[yellow]平台 {plat} 暂未提供投递适配器，跳过 {len(plat_job_ids)} 个岗位[/yellow]")
                 continue
 
             plat_config = dict(config)

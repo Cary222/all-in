@@ -5,7 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 from threading import Event
-from typing import Any, Callable
+from time import monotonic
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
 from allin.collection.base import CollectionError, CollectorHooks
@@ -21,11 +22,14 @@ from allin.collection.platforms.liepin import LiepinCollector, get_liepin_city_c
 from allin.collection.platforms.zhilian import ZhilianCollector, get_zhilian_city_code
 from allin.collection.registry import CollectorRegistry
 from allin.collection_run_store import (
-    boss_combo_key, boss_resume_options, claim_boss_resume, create_collection_run,
-    save_boss_checkpoint, update_collection_run,
+    append_collected_job_ids, boss_combo_key, boss_resume_options, claim_boss_resume,
+    create_collection_run, save_boss_checkpoint, update_collection_run,
 )
 from allin.db import get_db, insert_job_if_new, job_identity_exists
 from allin.job_filters import matching_blocked_company, matching_deal_breaker
+
+if TYPE_CHECKING:
+    import sqlite3
 
 
 SUPPORTED_PLATFORMS = {"boss", "zhilian", "51job", "liepin"}
@@ -348,6 +352,12 @@ class CollectionOrchestrator:
         self.run_id = run_id or str(uuid4())
         self.task_id = task_id
         self.stop_event = config.get("_workbench_stop_event")
+        # Per-candidate progress persists are bounded (see `_should_skip_persist`);
+        # page/phase transitions still persist immediately.
+        self._emit_persist_interval = 1.0
+        self._last_emit_persist: float | None = None
+        self._persisted_id_counts: dict[str, int] = {}
+        self._conn: sqlite3.Connection | None = None
 
     def run(self, raw_options: dict[str, Any] | None = None) -> dict[str, Any]:
         resume_id = raw_options.get("resume_run_id") if isinstance(raw_options, dict) else None
@@ -371,10 +381,17 @@ class CollectionOrchestrator:
                 self.db_path, run_id=self.run_id, task_id=self.task_id, options=options,
                 platform_states=states, enable_boss_resume=order == ["boss"],
             )
+        if previous:
+            # A resumed run already has these ids stored, so the per-platform counters
+            # start at their existing length instead of re-appending them.
+            self._persisted_id_counts["boss"] = len(previous["collected_job_ids"])
         checkpoint_pages = dict(previous["boss_checkpoint"]["pages"]) if previous else {}
         all_new_ids: list[str] = list(previous["collected_job_ids"]) if previous else []
         platform_results: list[PlatformCollectionResult] = []
         conn = get_db(self.db_path)
+        # Exposed for the per-candidate append hot path so it reuses this connection
+        # instead of opening (and re-initialising) its own for every saved job.
+        self._conn = conn
 
         def checkpoint(city: str, keyword: str, page: int) -> None:
             checkpoint_pages[boss_combo_key(city, keyword)] = page
@@ -397,8 +414,12 @@ class CollectionOrchestrator:
                 processor = _SharedProcessor(
                     conn, request, run_id=self.run_id, platform_index=index, platform_total=len(order),
                     stop_event=self.stop_event, config=self.config,
+                    # Per-candidate ticks are throttled: one durable write per second
+                    # instead of one per saved job (thousands of jobs made this
+                    # quadratic). Page/phase transitions persist unthrottled below.
                     emit=lambda progress, p=platform, processor_ref=None: self._emit(
-                        states, p, progress, all_new_ids, processor_ref.new_job_ids if processor_ref else []
+                        states, p, progress, all_new_ids,
+                        processor_ref.new_job_ids if processor_ref else [], throttle=True,
                     ),
                 )
                 if previous:
@@ -409,7 +430,7 @@ class CollectionOrchestrator:
                 # Bind the processor into the callback after construction so the
                 # current platform's progress is not confused with prior IDs.
                 processor.emit = lambda progress, p=platform, processor_ref=processor: self._emit(
-                    states, p, progress, all_new_ids, processor_ref.new_job_ids
+                    states, p, progress, all_new_ids, processor_ref.new_job_ids, throttle=True
                 )
                 hooks = CollectorHooks(
                     stop_event=self.stop_event,
@@ -533,6 +554,8 @@ class CollectionOrchestrator:
         progress: CollectionProgress,
         all_new_ids: list[str],
         platform_new_ids: list[str],
+        *,
+        throttle: bool = False,
     ) -> None:
         progress.new = len(platform_new_ids) if progress.platform == platform else progress.new
         states[platform].update({
@@ -553,7 +576,33 @@ class CollectionOrchestrator:
         }
         if callable(callback):
             callback(state)
+        # Newly saved jobs are recorded immediately, one row insert each, so a crash
+        # can never lose an already-saved job — without rewriting the run's whole id
+        # list per candidate (that was quadratic for large collections). Counts are
+        # per platform: each platform's processor owns its own id list.
+        persisted = self._persisted_id_counts.get(platform, 0)
+        fresh_ids = platform_new_ids[persisted:]
+        if fresh_ids:
+            # Reuse the run's connection: opening a new one re-runs the whole schema
+            # initialisation, which dominated the per-job append cost.
+            append_collected_job_ids(self.db_path, self.run_id, fresh_ids, conn=self._conn)
+            self._persisted_id_counts[platform] = len(platform_new_ids)
+        if throttle and self._should_skip_persist():
+            return
+        self._last_emit_persist = monotonic()
         self._persist(states, [*all_new_ids, *platform_new_ids], platform)
+
+    def _should_skip_persist(self) -> bool:
+        """Rate-limit the (rewriting) full state persist between page/phase changes.
+
+        Each persist re-serialises the whole platform-state map, and the per-candidate
+        ticks outnumber page transitions by orders of magnitude. Collected ids are no
+        longer part of that cost (see ``append_collected_job_ids``), so throttle only
+        affects progress bookkeeping; page/phase transitions and the final result
+        still persist unthrottled.
+        """
+        last = self._last_emit_persist
+        return last is not None and (monotonic() - last) < self._emit_persist_interval
 
     def _emit_scoring(self, states: dict[str, dict[str, Any]], new_ids: list[str]) -> None:
         log = self.config.get("_workbench_log")

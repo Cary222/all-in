@@ -14,7 +14,7 @@ from allin.cancellation import (
     stop_requested,
 )
 from allin.db import (
-    get_db, get_jobs_by_status,
+    get_db, get_jobs_by_status, get_monitor_cursor, set_monitor_cursor,
     update_job_status, add_history, add_risk_event, set_platform_safety_lock,
 )
 from allin.throttle import RequestThrottle, SendWindowChecker
@@ -167,7 +167,11 @@ class MonitorSafetyGuard:
     def record_page_failure(self) -> None:
         self.consecutive_page_failures += 1
         if self.consecutive_page_failures >= self.limit:
-            _raise_monitor_risk("consecutive_page_failures", self.config)
+            _raise_monitor_risk(
+                "consecutive_page_failures",
+                self.config,
+                platform=self.config.get("_monitor_platform"),
+            )
 
     def record_page_success(self) -> None:
         self.consecutive_page_failures = 0
@@ -271,6 +275,124 @@ JS_EXTRACT_CONVERSATION = r"""
 })()
 """
 
+JS_ZHILIAN_EXTRACT_CONVERSATION = r"""
+(() => {
+    const normalize = v => String(v || '').replace(/\s+/g, ' ').trim();
+    const isVisible = el => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    };
+
+    // Zhilian splits the conversation view into `.im-message` items. There is no
+    // explicit self/other class, so direction is derived from horizontal position
+    // relative to the timeline panel (verified against the live site).
+    const panel = document.querySelector('.im-main-panel__timeline') ||
+                  document.querySelector('.im-main-panel');
+    const pr = panel ? panel.getBoundingClientRect() : null;
+    const panelCenter = pr ? pr.x + pr.width / 2 : null;
+
+    // Outer-most items only: Zhilian nests `.im-message` inside `.im-message`
+    // (the wrapper plus its bubble content), which otherwise yields each message
+    // twice and can double-count a card as both a card and a plain message.
+    const allMsgs = Array.from(document.querySelectorAll('.im-message')).filter(isVisible);
+    const msgs = allMsgs.filter(el => !allMsgs.some(other => other !== el && other.contains(el)));
+
+    const results = msgs.map(msg => {
+        const bubble = msg.querySelector('.im-message__bubble') || msg;
+        const br = bubble.getBoundingClientRect();
+        let sender = 'unknown';
+        if (panelCenter !== null) {
+            const center = br.x + br.width / 2;
+            sender = center > panelCenter ? 'me' : 'hr';
+        }
+        // `.im-message--custom` marks platform cards on the message element itself,
+        // e.g. the resume request "我想要一份你的简历，你是否同意？" (拒绝/同意).
+        const isCustom = msg.classList.contains('im-message--custom') ||
+                         !!msg.querySelector('.im-message--custom');
+        const text = normalize(msg.innerText);
+        return {
+            sender: sender,
+            text: text.substring(0, 500),
+            kind: isCustom ? 'custom_card' : 'message'
+        };
+    }).filter(m => m.text);
+
+    return JSON.stringify(results);
+})()
+"""
+
+
+JS_LIEPIN_EXTRACT_CONVERSATION = r"""
+(() => {
+    const normalize = v => String(v || '').replace(/\s+/g, ' ').trim();
+    const isVisible = el => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    };
+
+    // Liepin has no standalone IM centre (verified live: the site nav exposes no
+    // message entry). A conversation only exists inside the job page's chat modal
+    // `.im-ui-chat-modal-container`, opened by the job's 聊一聊/继续聊 button.
+    const modal = document.querySelector('.im-ui-chat-modal-container') ||
+                  document.querySelector('.im-ui-basic-chat-modal');
+    if (!modal) {
+        return JSON.stringify({error: 'chat_modal_not_found'});
+    }
+
+    // `.im-ui-message-item` is nested: the wrapper plus its content rows. Keep only
+    // the outermost items, otherwise each message is emitted several times (the
+    // same double-count bug already fixed for Zhilian).
+    const all = Array.from(modal.querySelectorAll('.im-ui-message-item')).filter(isVisible);
+    const items = all.filter(el => !all.some(other => other !== el && other.contains(el)));
+
+    const results = items.map(el => {
+        const body = el.querySelector('.im-ui-message-item-body');
+        const textEl = el.querySelector('.im-ui-txt-content .text') ||
+                       el.querySelector('.im-ui-txt-content');
+        const text = normalize(textEl ? textEl.innerText : el.innerText);
+
+        let sender = 'unknown';
+        if (!body) {
+            // No message body tile: platform tip (fee warning, read receipts, ...).
+            sender = 'system';
+        } else if (body.classList.contains('im-ui-message-item-send')) {
+            // Verified live: our own outbound bubble carries this marker.
+            sender = 'me';
+        } else {
+            // A real body that is not ours. Fail closed on the direction and let
+            // `_reconcile_conversation_messages` re-confirm against our greeting.
+            sender = 'hr';
+        }
+
+        return {
+            sender: sender,
+            text: text.substring(0, 500),
+            kind: 'message'
+        };
+    }).filter(m => m.text);
+
+    return JSON.stringify(results);
+})()
+"""
+
+
+def _conversation_extractor_js(platform: str) -> str:
+    """Return the conversation-reading script for a platform.
+
+    Only Zhilian and Liepin have verified platform-specific extractors; other
+    platforms fall back to the BOSS-shaped script, which is itself only valid on
+    BOSS. Callers must treat an empty result on unverified platforms as
+    "unsupported", not as "no messages".
+    """
+    if str(platform or "").lower() == "zhilian":
+        return JS_ZHILIAN_EXTRACT_CONVERSATION
+    if str(platform or "").lower() == "liepin":
+        return JS_LIEPIN_EXTRACT_CONVERSATION
+    return JS_EXTRACT_CONVERSATION
+
+
 # JS: Check if resume dialog appeared
 JS_CHECK_RESUME_DIALOG = """
 (async () => {
@@ -356,14 +478,26 @@ def _record_page_failure_unless_stopped(config: dict) -> None:
         _monitor_safety_guard(config).record_page_failure()
 
 
-def _record_monitor_risk(kind: str, config: dict | None = None) -> None:
-    """Persist a safe risk event without page text, URLs, or account data."""
+def _record_monitor_risk(
+    kind: str,
+    config: dict | None = None,
+    platform: str | None = None,
+) -> None:
+    """Persist a safe risk event without page text, URLs, or account data.
+
+    ``platform`` scopes the persisted safety lock. When omitted, the platform of
+    the cycle currently being checked is used (``_monitor_platform``). Scoping
+    matters: applying a non-BOSS risk signal (e.g. a Liepin captcha) to BOSS would
+    block BOSS delivery and monitoring until the cooldown expired.
+    """
     labels = {
         "captcha": "监测检测到验证码，已停止",
         "rate_limit": "监测检测到频率限制，已停止",
         "blocked": "监测检测到账号或请求拦截，已停止",
         "consecutive_page_failures": "监测连续页面失败达到阈值，已停止",
     }
+    if platform is None:
+        platform = (config or {}).get("_monitor_platform")
     db = None
     try:
         db = get_db()
@@ -373,7 +507,7 @@ def _record_monitor_risk(kind: str, config: dict | None = None) -> None:
             lock_minutes = max(int(raw_minutes), 1)
         except (TypeError, ValueError):
             lock_minutes = 10
-        set_platform_safety_lock(db, kind, minutes=lock_minutes)
+        set_platform_safety_lock(db, kind, minutes=lock_minutes, platform=platform)
     except Exception:
         # Failure to persist telemetry must never allow risky browsing to continue.
         pass
@@ -382,8 +516,8 @@ def _record_monitor_risk(kind: str, config: dict | None = None) -> None:
             db.close()
 
 
-def _raise_monitor_risk(kind: str, config: dict | None = None) -> None:
-    _record_monitor_risk(kind, config)
+def _raise_monitor_risk(kind: str, config: dict | None = None, platform: str | None = None) -> None:
+    _record_monitor_risk(kind, config, platform=platform)
     raise MonitorRiskDetected(kind)
 
 
@@ -490,19 +624,24 @@ def _looks_like_non_rejection_action_card(text: str) -> bool:
 
 
 def _looks_like_resume_request_card(text: str) -> bool:
-    """Detect BOSS rich-card requests for the user's attachment resume.
+    """Detect rich-card requests for the user's resume.
 
-    This is intentionally stricter than the normal text-message resume detector:
-    card handling should only trigger when strong attachment-resume wording appears
-    with an action or request signal.
+    Covers BOSS's attachment-resume card and Zhilian's resume-consent card
+    ("我想要一份你的简历，你是否同意？" with 拒绝/同意 actions). Intentionally
+    stricter than the plain-text detector: card handling should only trigger on
+    explicit request wording plus an action/consent signal.
     """
     text = text or ""
     attachment_signals = ["附件简历", "您的附件简历", "我的附件简历"]
+    # Zhilian's card asks for consent rather than naming an attachment.
+    consent_signals = ["你是否同意", "是否同意", "我想要一份你的简历", "我想要一份简历"]
     intent_signals = ["是否同意", "同意", "想要一份", "请求", "获取", "发送", "发给"]
     rejection_context = ["不匹配", "不合适", "不太合适", "不符合", "不太符合", "很遗憾", "无法推进", "祝", "已招满", "岗位已关闭"]
 
     if any(kw in text for kw in rejection_context):
         return False
+    if any(kw in text for kw in consent_signals):
+        return True
     return any(kw in text for kw in attachment_signals) and any(kw in text for kw in intent_signals)
 
 
@@ -870,9 +1009,40 @@ def _generate_auto_reply(messages: list[dict], job: dict, config: dict) -> str |
     return _call_claude(prompt, config)
 
 
-def _send_message_in_chat(target_id: str, message: str) -> bool:
-    """Send a text message in the current open chat via Vue handleSubmit."""
-    js_send = f"""
+JS_ZHILIAN_SEND_MESSAGE = r"""
+(() => {
+    const normalize = v => String(v || '').replace(/\s+/g, ' ').trim();
+    const message = __MESSAGE__;
+    const input = document.querySelector('textarea.im-sender__input');
+    if (!input) return JSON.stringify({success: false, error: 'no_input'});
+
+    // Set the value through the prototype setter so the SPA's own listeners see a
+    // real user edit, then dispatch the events it listens for.
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    if (setter) setter.call(input, message);
+    else input.value = message;
+    input.dispatchEvent(new Event('input', {bubbles: true}));
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+    if (normalize(input.value) !== normalize(message)) {
+        return JSON.stringify({success: false, error: 'fill_failed'});
+    }
+
+    // Enter submits in the Zhilian composer; keep it as the primary path and
+    // fall back to a visible send control if the composer needs a click.
+    const before = document.querySelectorAll('.im-message').length;
+    input.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+    }));
+    return JSON.stringify({success: true, messagesBefore: before});
+})()
+"""
+
+
+def _send_message_js(platform: str, message: str) -> str:
+    """Build the send-message script for a platform."""
+    if str(platform or "").lower() == "zhilian":
+        return JS_ZHILIAN_SEND_MESSAGE.replace("__MESSAGE__", json.dumps(message, ensure_ascii=False))
+    return f"""
     (() => {{
         const input = document.querySelector('#chat-input');
         if (!input) return JSON.stringify({{success: false, error: 'no_input'}});
@@ -892,7 +1062,15 @@ def _send_message_in_chat(target_id: str, message: str) -> bool:
         return JSON.stringify({{success: true}});
     }})()
     """
-    result = evaluate(target_id, js_send)
+
+
+def _send_message_in_chat(target_id: str, message: str, platform: str = "boss") -> bool:
+    """Send a text message in the currently open chat.
+
+    BOSS uses a Vue-internal submit; Zhilian uses a normal composer textarea.
+    Using the wrong one silently fails, so the caller must pass the platform.
+    """
+    result = evaluate(target_id, _send_message_js(platform, message))
     if not result:
         return False
     try:
@@ -900,6 +1078,155 @@ def _send_message_in_chat(target_id: str, message: str) -> bool:
         return data.get("success", False)
     except (json.JSONDecodeError, TypeError):
         return False
+
+
+def _open_zhilian_conversation(job: dict, config: dict) -> str | None:
+    """Open a Zhilian conversation from the IM centre.
+
+    Zhilian exposes no per-job chat entry (verified), so Strategy A (clicking a
+    button on the job page) cannot work. The IM centre lists conversations with
+    ``.im-session-item`` rows; clicking the matching row navigates to
+    ``/im?sessionId=<id>`` where the composer lives.
+    """
+    chat_url = _platform_chat_url("zhilian", config)
+    target_id = _open_monitor_tab(chat_url, config)
+    if not target_id:
+        _record_page_failure_unless_stopped(config)
+        return None
+
+    if _wait_or_stop(config, 4) or not _wait_for_page_or_stop(target_id, config, timeout=12):
+        close_tab(target_id)
+        _record_page_failure_unless_stopped(config)
+        return None
+
+    try:
+        _inspect_monitor_page(target_id, config)
+    except MonitorRiskDetected:
+        close_tab(target_id)
+        raise
+
+    company = json.dumps(str(job.get("company") or "").strip(), ensure_ascii=False)
+    title = json.dumps(str(job.get("title") or "").strip(), ensure_ascii=False)
+    hr_name = json.dumps(str(job.get("hr_name") or "").strip(), ensure_ascii=False)
+    click_js = f"""
+    (() => {{
+        const normalize = v => String(v || '').replace(/\\s+/g, ' ').trim();
+        const wanted = {{company: {company}, title: {title}, hrName: {hr_name}}};
+        const rows = Array.from(document.querySelectorAll('.im-session-item')).filter(el => {{
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        }});
+        const pick = (row, sel) => {{
+            const el = row.querySelector(sel);
+            return el ? normalize(el.innerText) : '';
+        }};
+        for (const row of rows) {{
+            const rowCompany = pick(row, '.im-session-item__company-name');
+            const rowJob = pick(row, '.im-session-item__job');
+            const rowName = pick(row, '.im-session-item__name');
+            const companyHit = !!wanted.company && !!rowCompany && rowCompany.includes(wanted.company);
+            const jobHit = !!wanted.title && !!rowJob && rowJob.includes(wanted.title);
+            const nameHit = !!wanted.hrName && !!rowName && rowName.includes(wanted.hrName);
+
+            // Strongest signal first: the same company AND the same job. Then the
+            // same company when we have no job title to compare. A bare name match
+            // is only trusted alongside a company match, never on its own.
+            const strong = companyHit && jobHit;
+            const companyOnly = companyHit && !wanted.title;
+            const namedWithCompany = nameHit && companyHit;
+            if (strong || companyOnly || namedWithCompany) {{
+                row.scrollIntoView({{block: 'center'}});
+                row.click();
+                return JSON.stringify({{
+                    success: true,
+                    matched: rowCompany + ' | ' + rowJob,
+                    how: strong ? 'company+job' : (companyOnly ? 'company' : 'name+company')
+                }});
+            }}
+        }}
+        return JSON.stringify({{
+            success: false,
+            reason: 'no_matching_row',
+            rowCount: rows.length,
+            rows: rows.slice(0, 5).map(r => ({{
+                name: pick(r, '.im-session-item__name'),
+                company: pick(r, '.im-session-item__company-name'),
+                job: pick(r, '.im-session-item__job')
+            }}))
+        }});
+    }})()
+    """
+    result = _parse_js_result(evaluate(target_id, click_js))
+    if not result.get("success"):
+        console.print(
+            f"[yellow]    智联会话列表未找到匹配会话（{result.get('reason')}）[/yellow]"
+        )
+        close_tab(target_id)
+        return None
+
+    if _wait_or_stop(config, 3) or not _wait_for_page_or_stop(target_id, config, timeout=10):
+        close_tab(target_id)
+        _record_page_failure_unless_stopped(config)
+        return None
+    try:
+        _inspect_monitor_page(target_id, config)
+    except MonitorRiskDetected:
+        close_tab(target_id)
+        raise
+    return target_id
+
+
+def _open_liepin_conversation(job: dict, config: dict) -> str | None:
+    """Open a Liepin conversation: job page → its chat modal (verified live).
+
+    Liepin exposes no standalone chat centre and the modal lives on the job page,
+    so this opens the job URL and clicks its own 聊一聊/继续聊 button. The returned
+    target stays on the job page with ``.im-ui-chat-modal-container`` open, which is
+    where ``JS_LIEPIN_EXTRACT_CONVERSATION`` reads the messages.
+    """
+    job_url = str(job.get("url") or "").strip()
+    if not job_url:
+        return None
+
+    target_id = _open_monitor_tab(job_url, config, background=False)
+    if not target_id:
+        _record_page_failure_unless_stopped(config)
+        return None
+
+    if _wait_or_stop(config, 3) or not _wait_for_page_or_stop(target_id, config, timeout=12):
+        close_tab(target_id)
+        _record_page_failure_unless_stopped(config)
+        return None
+    try:
+        _inspect_monitor_page(target_id, config)
+    except MonitorRiskDetected:
+        close_tab(target_id)
+        raise
+
+    raw = evaluate(target_id, JS_LIEPIN_OPEN_CHAT_MODAL)
+    try:
+        opened = json.loads(raw) if isinstance(raw, str) and raw else raw
+    except (json.JSONDecodeError, TypeError):
+        opened = None
+    if not isinstance(opened, dict):
+        close_tab(target_id)
+        _record_page_failure_unless_stopped(config)
+        return None
+    if opened.get("risk"):
+        close_tab(target_id)
+        _raise_monitor_risk(str(opened["risk"]), config, platform="liepin")
+    if opened.get("status") != "ok":
+        console.print(
+            f"[yellow]    猎聘聊天弹窗未打开（{opened.get('status')}）[/yellow]"
+        )
+        close_tab(target_id)
+        return None
+    try:
+        _inspect_monitor_page(target_id, config)
+    except MonitorRiskDetected:
+        close_tab(target_id)
+        raise
+    return target_id
 
 
 def _open_conversation(job: dict, config: dict) -> str | None:
@@ -914,6 +1241,17 @@ def _open_conversation(job: dict, config: dict) -> str | None:
     if stop_requested(config):
         return None
     job_url = job.get("url", "")
+
+    # Zhilian has no per-job chat entry point (verified live), so go straight to
+    # its IM centre and pick the matching conversation row.
+    if str(job.get("source_platform") or "").strip().lower() == "zhilian":
+        return _open_zhilian_conversation(job, config)
+
+    # Liepin keeps conversations inside the job page's chat modal, so the generic
+    # Strategy A below (which clicks BOSS/Zhilian/51job chat selectors) would never
+    # match its `a.btn-main[data-selector="chat-chat"]` button.
+    if str(job.get("source_platform") or "").strip().lower() == "liepin":
+        return _open_liepin_conversation(job, config)
 
     # Strategy A: Via job URL (try up to 2 times)
     if job_url:
@@ -946,7 +1284,11 @@ def _open_conversation(job: dict, config: dict) -> str | None:
             if platform == "boss":
                 clicked = click(target_id, ".btn-startchat") or click(target_id, "[ka*='chat']")
             elif platform == "zhilian":
-                clicked = click(target_id, "button.chat-btn") or click(target_id, "[class*='chat-button']") or click(target_id, ".chat-window") or click(target_id, "button[class*='btn']")
+                # Zhilian has no per-job chat entry on the job page (verified: the
+                # only chat affordance is the site-wide 消息 entry, which is a
+                # javascript: link). Conversations live in the IM centre instead,
+                # reached by the verified `.im-session-item` list.
+                clicked = False
             elif platform == "51job":
                 clicked = click(target_id, "[class*='chat']") or click(target_id, "button.chat") or click(target_id, "[class*='apply']")
             elif platform == "liepin":
@@ -993,15 +1335,10 @@ def _open_conversation_from_chat_list(
     """Open conversation from chat list. Matches by name+company, then company-only fallback."""
     if stop_requested(config):
         return None
-    monitor_cfg = config.get("monitor", {})
     platform = str(job.get("source_platform") or "boss").lower()
-    default_chat_urls = {
-        "boss": "https://www.zhipin.com/web/geek/chat",
-        "zhilian": "https://im.zhaopin.com/",
-        "51job": "https://we.51job.com/pc/message",
-        "liepin": "https://www.liepin.com/chat/",
-    }
-    chat_url = monitor_cfg.get(f"{platform}_chat_url") or (monitor_cfg.get("chat_url") if platform == "boss" else None) or default_chat_urls.get(platform, default_chat_urls["boss"])
+    # Single source of truth for entry points (see PLATFORM_CHAT_URLS): keeping a
+    # second hardcoded copy here is exactly what let the wrong URLs drift apart.
+    chat_url = _platform_chat_url(platform, config)
     target_id = _open_monitor_tab(chat_url, config, background=background)
     if not target_id:
         _record_page_failure_unless_stopped(config)
@@ -1137,11 +1474,24 @@ def _open_conversation_from_chat_list(
     return None
 
 
-def _deliver_resume_to_chat(target_id: str) -> bool:
-    """Send platform resume in an already-open chat conversation.
+def _deliver_resume_to_chat(target_id: str, platform: str = "boss") -> bool:
+    """Send the platform resume in an already-open chat conversation.
 
-    Flow: Click "发简历" → select resume → confirm send
+    BOSS flow: click "发简历" → select a resume → confirm send.
+
+    NOTE: this is currently unreferenced dead code (the resume step is handled by
+    the `needs_resume` state and manual sending). Zhilian has an equivalent path
+    via its resume-request card's 同意 button and the composer's 发简历 chip
+    (``.im-msg-11__btn--agree`` / ``.im-send-resume__chip``, verified live), but
+    wiring either one up would make an irreversible outbound send automatic, so it
+    deliberately stays manual until that behaviour is explicitly requested.
     """
+    if str(platform or "").lower() == "zhilian":
+        console.print(
+            "[dim]    智联简历投递为手动步骤（同意卡片/发简历按钮），未自动执行[/dim]"
+        )
+        return False
+
     # Click "发简历" button
     if not click(target_id, '[d-c="62009"]'):
         console.print("[dim]    未找到发简历按钮[/dim]")
@@ -1194,6 +1544,11 @@ def _check_boss_replies(config: dict, tracked_jobs: list[dict] | None = None) ->
 
     Returns list of conversations with replies (including matched job info).
     """
+    # Keep the risk-lock scope explicit: this key is shared across platform checks in
+    # one monitor cycle, so BOSS must re-assert its own platform rather than inherit
+    # whichever platform happened to be checked last.
+    config["_monitor_platform"] = "boss"
+
     db = get_db()
     if stop_requested(config):
         db.close()
@@ -1389,6 +1744,10 @@ def _check_platform_replies(
     if not tracked_jobs or stop_requested(config):
         return []
 
+    # Scope any risk lock raised while checking this platform to this platform only,
+    # so e.g. a Liepin captcha cannot block BOSS delivery and monitoring.
+    config["_monitor_platform"] = platform
+
     target_id = _open_monitor_tab(chat_url, config, background=True)
     if not target_id:
         return []
@@ -1397,60 +1756,7 @@ def _check_platform_replies(
         close_tab(target_id)
         return []
 
-    extract_js = """
-    (() => {
-        const text = (document.body ? document.body.innerText : '') + ' ' + (document.title || '');
-        if (/验证码|滑块|访问频繁|频率限制|账号异常|拒绝访问/.test(text)) {
-            return JSON.stringify({risk: 'captcha'});
-        }
-        if (/请先登录|扫码登录|账号登录/.test(text)) {
-            return JSON.stringify({risk: 'login_required'});
-        }
-
-        const isVisible = (el) => {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            const s = window.getComputedStyle(el);
-            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
-        };
-
-        const itemSelectors = [
-            '.conversation-item', '.chat-item', '.message-item', '.session-item',
-            '[class*="conversation-item"]', '[class*="chat-item"]', '[class*="session-item"]',
-            '[class*="im-item"]', 'li[class*="item"]', 'div[class*="list-item"]'
-        ];
-
-        let items = [];
-        for (const sel of itemSelectors) {
-            const found = Array.from(document.querySelectorAll(sel)).filter(isVisible);
-            if (found.length > 0) {
-                items = found;
-                break;
-            }
-        }
-
-        const results = [];
-        items.forEach((item, index) => {
-            const itemText = item.innerText || '';
-            const unreadEl = item.querySelector('[class*="unread"], [class*="badge"], [class*="red-dot"], [class*="notice"]');
-            const lines = itemText.split('\\n').map(l => l.trim()).filter(Boolean);
-            const title = lines[0] || '';
-            const sub = lines.length > 1 ? lines[1] : '';
-            const lastMsg = lines.length > 2 ? lines[lines.length - 1] : sub;
-
-            results.push({
-                index: index,
-                raw_text: itemText.substring(0, 300),
-                title: title,
-                last_message: lastMsg.substring(0, 200),
-                has_unread: !!unreadEl || /\\b\\d+\\b/.test(unreadEl ? unreadEl.innerText : ''),
-                has_reply: true
-            });
-        });
-
-        return JSON.stringify({success: true, results: results});
-    })()
-    """
+    extract_js = _build_list_extractor_js(platform)
     raw = evaluate(target_id, extract_js)
     close_tab(target_id)
     if not raw:
@@ -1465,6 +1771,14 @@ def _check_platform_replies(
         console.print(f"[yellow]{platform} 消息检测提示: {data.get('risk')}[/yellow]")
         return []
 
+    if isinstance(data, dict) and data.get("selectors_unverified"):
+        # No verified selectors for this platform: say so instead of implying the
+        # inbox is empty (silence here is what made dead platforms look healthy).
+        console.print(
+            f"[yellow]{platform} 尚未验证会话列表选择器，跳过该平台回复检测[/yellow]"
+        )
+        return []
+
     conversations = data.get("results", []) if isinstance(data, dict) else []
     if not conversations:
         return []
@@ -1474,19 +1788,42 @@ def _check_platform_replies(
     try:
         for conv in conversations:
             raw_text = conv.get("raw_text", "")
+            fields = conv.get("fields") if isinstance(conv.get("fields"), dict) else {}
+            row_company = str(fields.get("company") or "")
+            row_job = str(fields.get("job") or "")
+            row_name = str(fields.get("name") or "")
             for job in tracked_jobs:
                 company = (job.get("company") or "").strip()
                 title = (job.get("title") or "").strip()
                 hr_name = (job.get("hr_name") or "").strip()
+                # Prefer structured fields when the platform exposes them; fall
+                # back to the raw row text. Company+job agreeing is the strongest
+                # signal, so check against the structured values first.
                 match = False
-                if company and company in raw_text:
+                if company and ((row_company and company in row_company) or company in raw_text):
                     match = True
-                elif hr_name and hr_name in raw_text:
+                elif hr_name and ((row_name and hr_name in row_name) or hr_name in raw_text):
                     match = True
-                elif title and title in raw_text:
+                elif title and ((row_job and title in row_job) or title in raw_text):
                     match = True
 
                 if match:
+                    # The list preview shows the newest message, which is often our
+                    # own outbound greeting. Treating it as an HR reply both fakes a
+                    # reply and flips the job to `replied`. Only record a reply when
+                    # the preview is NOT our own greeting.
+                    preview = str(conv.get("last_message") or "")
+                    own_greeting = str(job.get("greeting") or "")
+                    if own_greeting and _matches_own_greeting(preview, own_greeting):
+                        conv["has_reply"] = False
+                        results.append({"job": job, "conversation": conv})
+                        console.print(
+                            f"[dim]  [{platform}] {job.get('company')} 会话最新消息仍是自己的招呼语，"
+                            "不计为 HR 回复[/dim]"
+                        )
+                        break
+
+                    conv["has_reply"] = True
                     if job.get("status") == "sent":
                         update_job_status(db, job["id"], "replied")
                         add_history(
@@ -1504,16 +1841,428 @@ def _check_platform_replies(
     return results
 
 
+# Per-platform chat-center entry points, verified against the live sites.
+# ``config.monitor.{platform}_chat_url`` overrides any of these.
+#
+# These were wrong before (and silently broke monitoring):
+#   - zhilian used ``im.zhaopin.com`` which answers 403; the real IM host is
+#     ``i.zhaopin.com`` and its chat center is ``/im``.
+#   - liepin used ``/chat/`` which redirects to the homepage; the conversation
+#     UI actually lives in the job page's chat dialog / the site drawer.
+#   - 51job's ``/pc/message`` renders an empty page; 51job has no web IM at all
+#     (HR conversations are pushed to WeChat), so monitoring is best-effort.
+PLATFORM_CHAT_URLS: dict[str, str] = {
+    "boss": "https://www.zhipin.com/web/geek/chat",
+    "zhilian": "https://i.zhaopin.com/im",
+    "51job": "https://we.51job.com/pc/message",
+    "liepin": "https://www.liepin.com/chat/",
+}
+
+
+def _platform_chat_url(platform: str, config: dict | None = None) -> str:
+    """Resolve a platform's chat-center URL, honouring config overrides."""
+    platform = str(platform or "boss").lower()
+    override = None
+    if config:
+        monitor_cfg = config.get("monitor", {})
+        if isinstance(monitor_cfg, dict):
+            override = monitor_cfg.get(f"{platform}_chat_url")
+            if not override and platform == "boss":
+                override = monitor_cfg.get("chat_url")
+    if override:
+        return str(override)
+    return PLATFORM_CHAT_URLS.get(platform, PLATFORM_CHAT_URLS["boss"])
+
+
+# Conversation-list selectors, keyed by platform. Only entries verified against
+# the live site belong here: a guessed selector produces confident nonsense (the
+# earlier implementation marked every row as a reply). Platforms absent from this
+# map report `selectors_unverified` instead of inventing matches.
+PLATFORM_LIST_SELECTORS: dict[str, dict[str, str]] = {
+    "zhilian": {
+        "item": ".im-session-item",
+        "name": ".im-session-item__name",
+        "company": ".im-session-item__company-name",
+        "job": ".im-session-item__job",
+        "preview": ".im-session-item__preview-text",
+        "tag": ".im-session-item__tag",
+        "time": ".im-session-item__time",
+    },
+}
+
+
+def _build_list_extractor_js(platform: str) -> str:
+    """Build the conversation-list extraction script for a platform.
+
+    Every platform gets the same risk prelude (captcha / login wall) so a blocked
+    page is never mistaken for an empty inbox. Rows are only parsed when the
+    platform has verified selectors.
+    """
+    selectors = PLATFORM_LIST_SELECTORS.get(str(platform or "").lower())
+    risk_prelude = """
+        const text = (document.body ? document.body.innerText : '') + ' ' + (document.title || '');
+        if (/验证码|滑块|访问频繁|频率限制|账号异常|拒绝访问/.test(text)) {
+            return JSON.stringify({risk: 'captcha'});
+        }
+        if (/请先登录|扫码登录|账号登录|密码登录/.test(text)) {
+            return JSON.stringify({risk: 'login_required'});
+        }
+        const isVisible = (el) => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+        };
+    """
+    if not selectors:
+        return f"""
+    (() => {{
+{risk_prelude}
+        return JSON.stringify({{selectors_unverified: true, results: []}});
+    }})()
+    """
+
+    item_sel = json.dumps(selectors["item"])
+    field_map = {
+        key: selectors[key]
+        for key in ("name", "company", "job", "preview", "tag", "time")
+        if key in selectors
+    }
+    field_map_js = json.dumps(field_map, ensure_ascii=False)
+    return f"""
+    (() => {{
+{risk_prelude}
+        const itemSelector = {item_sel};
+        const fieldMap = {field_map_js};
+        const rows = Array.from(document.querySelectorAll(itemSelector)).filter(isVisible);
+
+        const results = rows.map((row, index) => {{
+            const pick = (sel) => {{
+                const el = row.querySelector(sel);
+                return el ? String(el.innerText || '').replace(/\\s+/g, ' ').trim() : '';
+            }};
+            const fields = {{}};
+            for (const [key, sel] of Object.entries(fieldMap)) {{
+                fields[key] = pick(sel);
+            }}
+            const itemText = String(row.innerText || '').replace(/\\s+/g, ' ').trim();
+            return {{
+                index: index,
+                raw_text: itemText.substring(0, 300),
+                title: fields.name || fields.company || '',
+                last_message: (fields.preview || '').substring(0, 200),
+                fields: fields,
+                has_unread: false,
+                // Direction is decided in Python against the job's own greeting.
+                has_reply: null
+            }};
+        }});
+        return JSON.stringify({{success: true, results: results}});
+    }})()
+    """
+
+
 def _check_zhilian_replies(config: dict, tracked_jobs: list[dict]) -> list[dict]:
-    return _check_platform_replies("zhilian", "https://im.zhaopin.com/", config, tracked_jobs)
+    return _check_platform_replies(
+        "zhilian", _platform_chat_url("zhilian", config), config, tracked_jobs
+    )
 
 
 def _check_job51_replies(config: dict, tracked_jobs: list[dict]) -> list[dict]:
-    return _check_platform_replies("51job", "https://we.51job.com/pc/message", config, tracked_jobs)
+    return _check_platform_replies(
+        "51job", _platform_chat_url("51job", config), config, tracked_jobs
+    )
+
+
+# Liepin keeps every conversation inside the job page's chat modal; there is no
+# message-centre page to scan (verified live). This script opens that modal from
+# the job's own 聊一聊/继续聊 button and reports why it could not, so a closed or
+# unreadable conversation is never mistaken for "no reply".
+JS_LIEPIN_OPEN_CHAT_MODAL = r"""
+(async () => {
+    const normalize = v => String(v || '').replace(/\s+/g, ' ').trim();
+    const isVisible = el => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+    };
+
+    const url = String(location.href || '');
+    const pageText = normalize(document.body ? document.body.innerText : '') +
+        ' ' + normalize(document.title);
+    if (
+        String(location.hostname || '') === 'safe.liepin.com' ||
+        /captchaPage|安全中心/.test(url) ||
+        /验证码|滑块|访问频繁|访问过于频繁|频率限制|账号异常|拒绝访问|安全验证|行为异常/.test(pageText)
+    ) {
+        return JSON.stringify({risk: 'captcha'});
+    }
+    if (/请先登录|扫码登录|账号登录|密码登录/.test(pageText)) {
+        return JSON.stringify({risk: 'login_required'});
+    }
+
+    // Re-query on every poll: React replaces the modal node while it renders, so a
+    // reference captured once goes stale (still "found", but detached and always
+    // reporting 0 messages — verified live).
+    // Prefer the visible node: `.im-ui-chat-modal-container` is a zero-size mount
+    // point while the rendered modal is its inner `.im-ui-basic-chat-modal`, so
+    // always taking the first match made every visibility check fail (verified live).
+    const findModal = () => {
+        const candidates = Array.from(document.querySelectorAll(
+            '.im-ui-chat-modal-container, .im-ui-basic-chat-modal'
+        ));
+        return candidates.find(isVisible) ||
+               candidates.find(el => el.querySelector('.im-ui-message-item')) ||
+               candidates[0] || null;
+    };
+    // Presence is not enough: Liepin pre-mounts a hidden (empty) modal container on
+    // page load. Treating that as "already open" skipped the click and then waited
+    // forever inside a hidden node (verified live: 0 messages while the same page
+    // yielded 2 after a real click).
+    let modal = findModal();
+    if (!isVisible(modal)) {
+        const button = document.querySelector(
+            'section.job-apply-container .job-apply-operate .apply-box > a[data-selector="chat-chat"]'
+        ) || document.querySelector('a.btn-main[data-selector="chat-chat"]');
+        if (!isVisible(button)) {
+            return JSON.stringify({
+                status: 'chat_entry_missing',
+                entry_texts: Array.from(
+                    document.querySelectorAll('section.job-apply-container .apply-box > a')
+                ).filter(isVisible).map(el => normalize(el.innerText)).slice(0, 6)
+            });
+        }
+        button.click();
+        for (let i = 0; i < 24; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            modal = findModal();
+            if (isVisible(modal)) break;
+        }
+    }
+    if (!isVisible(modal)) {
+        return JSON.stringify({status: 'chat_modal_timeout'});
+    }
+
+    // The modal container appears before its messages finish rendering (verified
+    // live: opening the modal and reading immediately yielded 0 messages while the
+    // same modal had 2 a few seconds later). Wait for real message items, otherwise
+    // an empty read is indistinguishable from "no reply".
+    let messageCount = 0;
+    for (let i = 0; i < 20; i++) {
+        const current = findModal();
+        messageCount = current ? current.querySelectorAll('.im-ui-message-item').length : 0;
+        if (messageCount > 0) break;
+        await new Promise(r => setTimeout(r, 500));
+    }
+    if (messageCount === 0) {
+        // A conversation we greeted must contain at least our own greeting, so an
+        // empty render means the history did not load. Reporting `ok` here would
+        // silently turn this platform's monitoring into a no-op.
+        return JSON.stringify({status: 'chat_messages_not_rendered'});
+    }
+
+    const settled = findModal() || modal;
+    const historyText = normalize(settled.innerText || '');
+    // Liepin replaces some history with a placeholder ("不支持此消息查看"). When
+    // that happens we cannot prove whether an HR message arrived after ours, so
+    // the caller must skip instead of guessing.
+    const hiddenMarkers = [
+        '不支持此消息查看', '登录“猎聘APP”查看消息内容', '登录猎聘APP查看消息内容',
+        '请使用猎聘APP查看', '消息内容暂不支持查看'
+    ];
+    return JSON.stringify({
+        status: 'ok',
+        history_readable: !hiddenMarkers.some(marker => historyText.includes(marker)),
+        message_count: messageCount
+    });
+})()
+"""
+
+
+def _check_liepin_job_reply(job: dict, config: dict, db) -> dict | None:
+    """Read one Liepin job's chat modal and report an HR reply, if any.
+
+    Liepin has no message centre, so this costs one job-page visit per tracked job.
+    The caller bounds how many jobs are visited per cycle.
+    """
+    job_url = str(job.get("url") or "").strip()
+    if not job_url:
+        return None
+
+    target_id = _open_monitor_tab(job_url, config, background=True)
+    if not target_id:
+        _record_page_failure_unless_stopped(config)
+        return None
+
+    try:
+        if _wait_or_stop(config, 3) or not _wait_for_page_or_stop(target_id, config, timeout=12):
+            _record_page_failure_unless_stopped(config)
+            return None
+        try:
+            _inspect_monitor_page(target_id, config)
+        except MonitorRiskDetected:
+            raise
+        opened_raw = evaluate(target_id, JS_LIEPIN_OPEN_CHAT_MODAL)
+        opened = json.loads(opened_raw) if isinstance(opened_raw, str) and opened_raw else opened_raw
+        if not isinstance(opened, dict):
+            _monitor_safety_guard(config).record_page_failure()
+            return None
+        if opened.get("risk"):
+            console.print(f"[yellow]猎聘监测提示: {opened.get('risk')}[/yellow]")
+            _record_page_failure_unless_stopped(config)
+            return None
+        if opened.get("status") != "ok":
+            # The page itself is fine — there is just no readable conversation yet
+            # (job closed, or the chat entry has not rendered). Not a page failure.
+            console.print(
+                f"[dim]  [liepin] {job.get('company')} 未打开聊天弹窗（{opened.get('status')}）[/dim]"
+            )
+            _monitor_safety_guard(config).record_page_success()
+            return None
+        if not opened.get("history_readable", False):
+            console.print(
+                f"[yellow]  [liepin] {job.get('company')} 会话历史含不可读消息，跳过以免误判[/yellow]"
+            )
+            _monitor_safety_guard(config).record_page_success()
+            return None
+
+        messages_raw = evaluate(target_id, _conversation_extractor_js("liepin"))
+    finally:
+        close_tab(target_id)
+
+    try:
+        messages = json.loads(messages_raw) if isinstance(messages_raw, str) else messages_raw
+    except (json.JSONDecodeError, TypeError):
+        _monitor_safety_guard(config).record_page_failure()
+        return None
+    if not isinstance(messages, list) or not messages:
+        return None
+
+    _monitor_safety_guard(config).record_page_success()
+    messages = _reconcile_conversation_messages(messages, job)
+
+    # A reply only exists when the newest real message is HR's. If our own greeting
+    # is still last, there is nothing to handle — claiming otherwise would flip the
+    # job to `replied` on our own message.
+    last = next(
+        (message for message in reversed(messages) if message.get("sender") in {"me", "hr"}),
+        None,
+    )
+    if not last or last.get("sender") != "hr":
+        return None
+
+    conversation = {
+        "hr_name": str(job.get("hr_name") or ""),
+        "company": str(job.get("company") or ""),
+        "last_message": str(last.get("text") or "")[:200],
+        "has_reply": True,
+        "has_unread": False,
+        "messages": messages,
+    }
+
+    pending = _get_unresolved_pending_reply(db, job["id"])
+    if pending and _pending_matches_chat_list(_row_text(pending, "detail"), conversation):
+        console.print(
+            f"[dim]  跳过已有待确认回复: {job.get('company')} - {job.get('title')}[/dim]"
+        )
+        return None
+    handled = _get_latest_handled_reply(db, job["id"])
+    if handled and _handled_reply_matches_chat_list(_row_text(handled, "detail"), conversation):
+        console.print(
+            f"[dim]  跳过已处理的相同HR消息: {job.get('company')} - {job.get('title')}[/dim]"
+        )
+        return None
+
+    if job.get("status") == "sent":
+        update_job_status(db, job["id"], "replied")
+        add_history(
+            db,
+            job["id"],
+            "hr_reply_detected",
+            f"猎聘 HR回复: {conversation['last_message'][:50]}",
+        )
+    console.print(
+        f"[green]  ✓ [liepin] {job.get('company')} - {job.get('title')} 检测到新回复[/green]"
+    )
+    return {"job": job, "conversation": conversation}
 
 
 def _check_liepin_replies(config: dict, tracked_jobs: list[dict]) -> list[dict]:
-    return _check_platform_replies("liepin", "https://www.liepin.com/chat/", config, tracked_jobs)
+    """Check Liepin replies job by job.
+
+    Unlike the message-centre platforms this pays one page visit per job, so each
+    cycle inspects ``monitor.max_conversations_per_cycle`` jobs, continuing after the
+    job the previous cycle stopped at. Without that resume point the same first few
+    jobs were re-checked every cycle and the rest were never visited.
+    """
+    if not tracked_jobs or stop_requested(config):
+        return []
+
+    # Keep the risk-lock scope explicit for this platform.
+    config["_monitor_platform"] = "liepin"
+
+    monitor_cfg = config.get("monitor", {}) if isinstance(config.get("monitor"), dict) else {}
+    try:
+        max_jobs = max(int(monitor_cfg.get("max_conversations_per_cycle", 5)), 1)
+    except (TypeError, ValueError):
+        max_jobs = 5
+
+    db = get_db()
+    results: list[dict] = []
+    try:
+        jobs, remaining = _liepin_cycle_window(db, tracked_jobs, max_jobs)
+        if remaining:
+            console.print(
+                f"[dim]  猎聘本轮检查 {len(jobs)} 个会话（上限 {max_jobs}），"
+                f"其余 {remaining} 个下轮继续[/dim]"
+            )
+        for job in jobs:
+            if stop_requested(config):
+                break
+            try:
+                found = _check_liepin_job_reply(job, config, db)
+            except MonitorRiskDetected:
+                raise
+            # Advance even when nothing was found, so a job without a reply cannot
+            # starve the ones behind it.
+            set_monitor_cursor(db, "liepin", str(job.get("id") or ""))
+            if found:
+                results.append(found)
+    finally:
+        db.close()
+    return results
+
+
+def _liepin_cycle_window(
+    db,
+    tracked_jobs: list[dict],
+    max_jobs: int,
+) -> tuple[list[dict], int]:
+    """Return the jobs to inspect this cycle, continuing after the stored cursor.
+
+    Rotation is by position in ``tracked_jobs`` rather than by id value: the list is
+    ordered by score, so paging by id would skip jobs whose ids sort earlier.
+    """
+    cursor = get_monitor_cursor(db, "liepin")
+    if not cursor:
+        return tracked_jobs[:max_jobs], max(len(tracked_jobs) - max_jobs, 0)
+
+    start = 0
+    for index, job in enumerate(tracked_jobs):
+        if str(job.get("id") or "") == cursor:
+            # Continue with the job after the cursor, wrapping at the end so a cycle
+            # never returns fewer jobs than are available.
+            start = index + 1
+            break
+
+    if start >= len(tracked_jobs):
+        start = 0
+    window = [tracked_jobs[(start + offset) % len(tracked_jobs)] for offset in range(min(max_jobs, len(tracked_jobs)))]
+    remaining = max(len(tracked_jobs) - len(window), 0)
+    if not window:
+        return [], 0
+    return window, remaining
 
 
 def check_replies(config: dict) -> list[dict]:
@@ -1673,8 +2422,11 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
         close_tab(target_id)
         return "stopped"
 
-    # Extract full BOSS conversation messages.
-    raw = evaluate(target_id, JS_EXTRACT_CONVERSATION)
+    # Extract the conversation using the platform's own reader. The BOSS-shaped
+    # default only understands BOSS DOM, so using it elsewhere silently yields
+    # nothing (and previously made every non-BOSS reply fail here).
+    platform = str(job.get("source_platform") or "boss").strip().lower()
+    raw = evaluate(target_id, _conversation_extractor_js(platform))
     if stop_requested(config):
         close_tab(target_id)
         return "stopped"
@@ -1802,7 +2554,7 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
                 if stop_requested(config):
                     close_tab(target_id)
                     return "stopped"
-                if _send_message_in_chat(target_id, link_msg):
+                if _send_message_in_chat(target_id, link_msg, platform):
                     portfolio_status = "在线简历已发送"
                     console.print("[green]    ✓ 在线简历链接已发送[/green]")
                 else:
@@ -1893,7 +2645,7 @@ def _handle_conversation(job: dict, config: dict, conversation: dict | None = No
     if stop_requested(config):
         close_tab(target_id)
         return "stopped"
-    if _send_message_in_chat(target_id, reply):
+    if _send_message_in_chat(target_id, reply, platform):
         console.print("[green]    ✓ 自动回复已发送[/green]")
         db = get_db()
         add_history(
@@ -2210,7 +2962,9 @@ def _check_follow_ups(config: dict, throttle, replied_job_ids: set | None = None
         if stop_event and stop_event.is_set():
             close_tab(target_id)
             break
-        if _send_message_in_chat(target_id, follow_up_msg):
+        if _send_message_in_chat(
+            target_id, follow_up_msg, str(job.get("source_platform") or "boss").lower()
+        ):
             console.print(f"[green]  ✓ 跟进: {job['company']} - {job['title']}[/green]")
             update_job_status(db, job["id"], "follow_up_sent")
             add_history(db, job["id"], "follow_up_sent", follow_up_msg[:100])

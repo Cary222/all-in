@@ -69,12 +69,12 @@ def runtime(tmp_path, monkeypatch):
         monkeypatch.setattr(server, name, value)
     path = tmp_path / "data/allin.db"
     monkeypatch.setattr(db_module, "DB_PATH", path)
-    (tmp_path / "resume.md").write_text("测试简历：产品经理，负责人工智能产品设计。")
+    (tmp_path / "resume.md").write_text("测试简历：产品经理，负责人工智能产品设计。", encoding="utf-8")
     server.CONFIG_PATH.write_text(yaml.safe_dump({
         "profile": {"resume_path": str(tmp_path / "resume.md")},
         "ai": {"scoring_concurrency": 1, "scoring_max_attempts": 1},
         "search": {"keywords": ["原关键词"], "cities": ["北京"]},
-    }, allow_unicode=True))
+    }, allow_unicode=True), encoding="utf-8")
     monkeypatch.setattr(server, "get_ai_api_key", lambda _: "offline-placeholder")
     ai = Mock(return_value=SCORE_RESPONSE)
     monkeypatch.setattr(scorer, "_call_claude", ai)

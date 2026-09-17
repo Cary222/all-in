@@ -230,6 +230,16 @@ class BrowserRuntimeManagerTests(unittest.TestCase):
         self.assertEqual(env["ALLIN_CHROME_PORTS"], "9222,9333")
         self.assertEqual(env["ALLIN_ENABLE_PORT_GUARD"], "false")
 
+    @patch("allin.browser.runtime.start_runtime", side_effect=OSError(22, "Invalid argument"))
+    @patch("allin.browser.runtime.check_node_available", return_value={"available": True, "version": "v22.1.0"})
+    @patch("allin.browser.runtime.runtime_targets", return_value=None)
+    def test_ensure_runtime_handles_oserror_gracefully(self, runtime_targets, check_node, start_runtime):
+        from allin.browser.runtime import ensure_runtime
+
+        config = {"browser": {"runtime": "builtin", "auto_start_proxy": True, "proxy_host": "127.0.0.1", "proxy_port": 3456}}
+        result = ensure_runtime(config, wait_seconds=0.01)
+        self.assertFalse(result)
+
 
 class BrowserRuntimeSourceTests(unittest.TestCase):
     def test_cdp_proxy_fetches_browser_websocket_url_for_fallback_ports(self):

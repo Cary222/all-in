@@ -88,16 +88,70 @@ def update_collection_run(
             f"UPDATE collection_runs SET {', '.join(assignments)} WHERE id = ?",
             values,
         )
+        if collected_job_ids is not None:
+            # A full update is authoritative: the child table backs every read, so it
+            # has to follow the JSON column, otherwise ids added later would be
+            # silently invisible (the child rows would win on read).
+            ordered = list(dict.fromkeys(str(job_id) for job_id in collected_job_ids if str(job_id)))
+            conn.execute("DELETE FROM collection_run_jobs WHERE run_id = ?", (run_id,))
+            conn.executemany(
+                "INSERT OR IGNORE INTO collection_run_jobs (run_id, job_id, position) VALUES (?, ?, ?)",
+                [(run_id, job_id, position) for position, job_id in enumerate(ordered)],
+            )
         conn.commit()
     finally:
         conn.close()
     return get_collection_run(db_path, run_id)
 
 
+def append_collected_job_ids(
+    db_path: Path | None,
+    run_id: str,
+    job_ids: list[str],
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Append newly saved job ids with one row insert each.
+
+    This is the crash-safe hot path: a saved job is recorded immediately, but the
+    cost stays O(1) per job instead of rewriting the run's whole id list. The run
+    row's JSON column is left alone here and refreshed in bulk on the next full
+    state update (see ``update_collection_run``).
+
+    Callers that already hold a connection should pass it: opening one re-runs the
+    whole schema initialisation, which dominated the cost of a per-job append.
+    """
+    pending = [str(job_id) for job_id in job_ids if str(job_id)]
+    if not pending:
+        return
+    owned = conn is None
+    connection = conn if conn is not None else get_db(db_path)
+    try:
+        next_position = connection.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM collection_run_jobs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
+        connection.executemany(
+            "INSERT OR IGNORE INTO collection_run_jobs (run_id, job_id, position) VALUES (?, ?, ?)",
+            [(run_id, job_id, next_position + offset) for offset, job_id in enumerate(pending)],
+        )
+        connection.commit()
+    finally:
+        if owned:
+            connection.close()
+
+
 def get_collection_run(db_path: Path, run_id: str) -> dict[str, Any] | None:
     conn = get_db(db_path)
     try:
         row = conn.execute("SELECT * FROM collection_runs WHERE id = ?", (run_id,)).fetchone()
+        stored_ids = [
+            str(record[0])
+            for record in conn.execute(
+                "SELECT job_id FROM collection_run_jobs WHERE run_id = ? ORDER BY position",
+                (run_id,),
+            ).fetchall()
+        ]
     finally:
         conn.close()
     if not row:
@@ -105,7 +159,11 @@ def get_collection_run(db_path: Path, run_id: str) -> dict[str, Any] | None:
     result = dict(row)
     result["options"] = _decode(result.pop("options_json", ""), {})
     result["platform_states"] = _decode(result.pop("platform_states_json", ""), {})
-    result["collected_job_ids"] = _decode(result.pop("collected_job_ids_json", ""), [])
+    # The child table is authoritative; the JSON column is only a fallback for rows
+    # written before it existed (and is still written on full state updates).
+    result["collected_job_ids"] = stored_ids or _decode(result.pop("collected_job_ids_json", ""), [])
+    if stored_ids:
+        result.pop("collected_job_ids_json", None)
     result["boss_checkpoint"] = _decode(result.pop("boss_checkpoint_json", ""), {})
     result["can_resume"] = can_resume_boss_run(result)
     return result

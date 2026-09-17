@@ -388,7 +388,9 @@ class MonitorIdempotencyAndLimitTests(unittest.TestCase):
         self.assertEqual(later_action, "auto_replied")
         self.assertEqual(auto_reply_count, 2)
         generate_reply.assert_called_once()
-        send_message.assert_called_once_with("later-target", "第二轮自动回复")
+        # The platform is passed explicitly so the right composer is used (BOSS
+        # uses a Vue-internal submit, Zhilian a plain textarea).
+        send_message.assert_called_once_with("later-target", "第二轮自动回复", "boss")
 
     def test_chat_list_skips_same_pending_before_opening_and_caps_new_items(self):
         from allin.executor import monitor
@@ -593,6 +595,224 @@ class MonitorRiskTests(unittest.TestCase):
         self.assertEqual(raised.exception.kind, "consecutive_page_failures")
         self.assertEqual(event["event_type"], "monitor_consecutive_page_failures")
 
+    def test_platform_risk_lock_is_scoped_to_its_own_platform(self):
+        """A non-BOSS risk signal must never lock BOSS.
+
+        ``set_platform_safety_lock`` defaults to the BOSS platform. If a Liepin
+        captcha were recorded without an explicit platform, it would write a BOSS
+        lock and block BOSS delivery and monitoring until the cooldown expired.
+        """
+        from allin.executor import monitor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "data" / "allin.db"
+            get_db(db_path).close()
+
+            def open_db():
+                return get_db(db_path)
+
+            with patch.object(monitor, "get_db", side_effect=open_db):
+                monitor._record_monitor_risk("captcha", {"_monitor_platform": "liepin"})
+
+            verify_db = get_db(db_path)
+            try:
+                rows = {
+                    str(row["platform"]): str(row["reason"])
+                    for row in verify_db.execute(
+                        "SELECT platform, reason FROM platform_safety_state"
+                    ).fetchall()
+                }
+            finally:
+                verify_db.close()
+
+        self.assertEqual(rows.get("liepin"), "captcha")
+        self.assertNotIn("boss", rows, "a Liepin captcha must not create a BOSS lock")
+
+    def test_boss_risk_lock_still_targets_boss(self):
+        """The BOSS platform scope must keep working after the fix."""
+        from allin.executor import monitor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "data" / "allin.db"
+            get_db(db_path).close()
+
+            def open_db():
+                return get_db(db_path)
+
+            with patch.object(monitor, "get_db", side_effect=open_db):
+                monitor._record_monitor_risk("rate_limit", {"_monitor_platform": "boss"})
+
+            verify_db = get_db(db_path)
+            try:
+                row = verify_db.execute(
+                    "SELECT platform, reason FROM platform_safety_state"
+                ).fetchone()
+            finally:
+                verify_db.close()
+
+        self.assertEqual(str(row["platform"]), "boss")
+        self.assertEqual(str(row["reason"]), "rate_limit")
+
+    def test_own_greeting_preview_is_not_counted_as_hr_reply(self):
+        """A conversation whose newest message is our own greeting is not a reply.
+
+        The chat-list preview shows the newest message. For a freshly greeted job
+        that is our own outbound greeting, so treating it as an HR reply both fakes
+        a reply and flips the job to `replied`.
+        """
+        from allin.executor import monitor
+
+        greeting = "您好，我对这个岗位很感兴趣，之前做过相关项目。"
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "data" / "allin.db"
+            db = get_db(db_path)
+            try:
+                insert_job(db, _job("own"))
+                db.execute("UPDATE jobs SET greeting = ? WHERE id = ?", (greeting, "own"))
+                db.commit()
+                update_job_status(db, "own", "sent")
+            finally:
+                db.close()
+
+            def open_db():
+                return get_db(db_path)
+
+            jobs = [dict(get_db(db_path).execute("SELECT * FROM jobs WHERE id='own'").fetchone())]
+            get_db(db_path).close()
+
+            list_payload = json.dumps({
+                "success": True,
+                "results": [{
+                    "index": 0,
+                    "raw_text": f"公司-own 岗位-own {greeting}",
+                    "title": "岗位-own",
+                    "last_message": greeting,
+                    "has_unread": False,
+                    "has_reply": None,
+                }],
+            })
+
+            with patch.object(monitor, "get_db", side_effect=open_db), \
+                 patch.object(monitor, "_open_monitor_tab", return_value="chat-target"), \
+                 patch.object(monitor, "_wait_or_stop", return_value=False), \
+                 patch.object(monitor, "_wait_for_page_or_stop", return_value=True), \
+                 patch.object(monitor, "evaluate", return_value=list_payload), \
+                 patch.object(monitor, "close_tab"):
+                results = monitor._check_platform_replies("liepin", "https://x.test/chat", {}, jobs)
+
+            verify_db = get_db(db_path)
+            try:
+                status = str(verify_db.execute("SELECT status FROM jobs WHERE id='own'").fetchone()["status"])
+                hr_events = verify_db.execute(
+                    "SELECT COUNT(*) AS c FROM history WHERE job_id='own' AND action='hr_reply_detected'"
+                ).fetchone()["c"]
+            finally:
+                verify_db.close()
+
+        self.assertEqual(status, "sent", "own greeting must not flip the job to replied")
+        self.assertEqual(hr_events, 0, "own greeting must not be recorded as an HR reply")
+        self.assertTrue(results and results[0]["conversation"]["has_reply"] is False)
+
+    def test_platform_chat_urls_are_configurable_and_corrected(self):
+        """Entry points come from one source and honour config overrides."""
+        from allin.executor import monitor
+
+        # The previously broken hardcoded URLs must be gone.
+        self.assertEqual(monitor.PLATFORM_CHAT_URLS["zhilian"], "https://i.zhaopin.com/im")
+        self.assertNotIn("im.zhaopin.com", monitor.PLATFORM_CHAT_URLS["zhilian"])
+        # Overrides win.
+        self.assertEqual(
+            monitor._platform_chat_url("zhilian", {"monitor": {"zhilian_chat_url": "https://custom.test/im"}}),
+            "https://custom.test/im",
+        )
+        self.assertEqual(
+            monitor._platform_chat_url("boss", {"monitor": {"chat_url": "https://boss.test/chat"}}),
+            "https://boss.test/chat",
+        )
+        # Defaults are used when no override exists.
+        self.assertEqual(
+            monitor._platform_chat_url("51job", {}),
+            monitor.PLATFORM_CHAT_URLS["51job"],
+        )
+
+    def test_unverified_platform_reports_instead_of_silently_empty(self):
+        """A platform without verified selectors must say so, not look like an empty inbox.
+
+        Silence is what previously made dead platforms appear healthy: the generic
+        selector set matched nothing and the caller concluded "no replies".
+        """
+        from allin.executor import monitor
+
+        js = monitor._build_list_extractor_js("51job")
+        self.assertIn("selectors_unverified", js)
+        # Zhilian has verified selectors, so it must NOT take that branch.
+        zl = monitor._build_list_extractor_js("zhilian")
+        self.assertNotIn("selectors_unverified: true", zl)
+        self.assertIn(".im-session-item", zl)
+
+    def test_zhilian_list_extractor_uses_verified_field_selectors(self):
+        """Zhilian rows expose discrete fields; the extractor must read those."""
+        from allin.executor import monitor
+
+        js = monitor._build_list_extractor_js("zhilian")
+        for sel in (
+            ".im-session-item__name",
+            ".im-session-item__company-name",
+            ".im-session-item__job",
+            ".im-session-item__preview-text",
+        ):
+            self.assertIn(sel, js)
+
+    def test_zhilian_conversation_reader_uses_position_for_direction(self):
+        """Zhilian has no self/other class, so direction comes from layout position."""
+        from allin.executor import monitor
+
+        js = monitor._conversation_extractor_js("zhilian")
+        self.assertIn(".im-message", js)
+        self.assertIn("panelCenter", js)
+        self.assertIn("im-message--custom", js)
+        # Zhilian nests `.im-message` inside `.im-message`; without de-duplication
+        # each message is read twice (verified live: 2 real messages came out as 4).
+        self.assertIn("other.contains(el)", js)
+        # Other platforms still fall back to the BOSS-shaped reader.
+        self.assertIs(
+            monitor._conversation_extractor_js("51job"),
+            monitor.JS_EXTRACT_CONVERSATION,
+        )
+
+    def test_zhilian_resume_request_card_is_detected(self):
+        """Zhilian asks for the resume with a consent card, not attachment wording.
+
+        Live wording: "我想要一份你的简历，你是否同意？" with 拒绝/同意 actions.
+        """
+        from allin.executor import monitor
+
+        card = "我想要一份你的简历，你是否同意？ 拒绝 同意"
+        self.assertTrue(monitor._looks_like_resume_request_card(card))
+        # It is HR's request even though the extractor cannot label the sender.
+        reconciled = monitor._reconcile_conversation_messages(
+            [{"sender": "unknown", "text": card, "kind": "custom_card"}],
+            {"greeting": "这是一段足够长的个性化招呼语用于比对测试"},
+        )
+        self.assertEqual(reconciled[0]["sender"], "hr")
+        self.assertTrue(monitor._detect_resume_request(reconciled))
+        # A rejection mentioning 简历-like context must not be read as a request.
+        self.assertFalse(
+            monitor._detect_resume_request([
+                {"sender": "hr", "text": "很遗憾，您与该岗位不太符合", "kind": "message"}
+            ])
+        )
+
+    def test_zhilian_send_uses_its_own_composer(self):
+        """Each platform needs its own send script; using the wrong one fails silently."""
+        from allin.executor import monitor
+
+        zl = monitor._send_message_js("zhilian", "你好")
+        self.assertIn("textarea.im-sender__input", zl)
+        boss = monitor._send_message_js("boss", "你好")
+        self.assertIn("#chat-input", boss)
+        self.assertNotIn("im-sender__input", boss)
+
 
 class FullFlowMonitorCooldownTests(unittest.TestCase):
     def test_full_flow_initial_cooldown_is_cancellable_before_first_scan(self):
@@ -620,6 +840,186 @@ class FullFlowMonitorCooldownTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [True])
         self.assertIn("首次监测冷却已取消", task.logs)
+
+
+class LiepinReplyMonitorTests(unittest.TestCase):
+    """Liepin keeps conversations inside the job page's chat modal (verified live)."""
+
+    def _liepin_job(self, job_id: str = "lp-1", greeting: str = "") -> dict:
+        job = _job(job_id, hr_name="")
+        job["source_platform"] = "liepin"
+        job["greeting"] = greeting
+        job["url"] = f"https://www.liepin.com/job/{job_id}.shtml"
+        return job
+
+    def test_liepin_uses_its_own_conversation_reader(self):
+        """The BOSS-shaped reader only understands BOSS DOM and would silently read nothing."""
+        from allin.executor import monitor
+
+        js = monitor._conversation_extractor_js("liepin")
+        self.assertIn(".im-ui-chat-modal-container", js)
+        self.assertIn("im-ui-message-item-send", js)
+        self.assertIsNot(js, monitor.JS_EXTRACT_CONVERSATION)
+        # Zhilian must keep its own verified reader (its list selector lives in
+        # PLATFORM_LIST_SELECTORS, while the conversation reader uses `.im-message`).
+        self.assertIn(".im-message", monitor._conversation_extractor_js("zhilian"))
+        # Still-unverified platforms keep falling back to the BOSS reader.
+        self.assertIs(
+            monitor._conversation_extractor_js("51job"),
+            monitor.JS_EXTRACT_CONVERSATION,
+        )
+
+    def test_every_liepin_job_gets_visited_across_cycles(self):
+        """Liepin pays one page visit per job, so the cap must rotate, not repeat.
+
+        Taking `tracked_jobs[:max_jobs]` every cycle re-checked the same first jobs
+        and left every job behind them permanently unvisited.
+        """
+        from allin.db import get_db, set_monitor_cursor
+        from allin.executor import monitor
+
+        jobs = [self._liepin_job(f"lp-{i}") for i in range(12)]
+        with tempfile.TemporaryDirectory() as tmp:
+            db = get_db(Path(tmp) / "data" / "allin.db")
+            try:
+                visited: list[str] = []
+                for _ in range(4):
+                    window, _remaining = monitor._liepin_cycle_window(db, jobs, 5)
+                    ids = [job["id"] for job in window]
+                    visited.extend(ids)
+                    set_monitor_cursor(db, "liepin", ids[-1])
+            finally:
+                db.close()
+
+        # Four cycles of 5 cover all 12 jobs (with wrap-around), and every job is seen.
+        self.assertEqual(sorted(set(visited), key=lambda value: int(value.split("-")[1])),
+                         [f"lp-{i}" for i in range(12)])
+
+    def test_liepin_cycle_window_wraps_and_reports_remaining(self):
+        """The window wraps at the end so a cycle is never short-changed."""
+        from allin.db import get_db, set_monitor_cursor
+        from allin.executor import monitor
+
+        jobs = [self._liepin_job(f"lp-{i}") for i in range(7)]
+        with tempfile.TemporaryDirectory() as tmp:
+            db = get_db(Path(tmp) / "data" / "allin.db")
+            try:
+                # Cursor sits on the last job: the next window must wrap to the start.
+                set_monitor_cursor(db, "liepin", "lp-6")
+                window, remaining = monitor._liepin_cycle_window(db, jobs, 3)
+                self.assertEqual([job["id"] for job in window], ["lp-0", "lp-1", "lp-2"])
+                self.assertEqual(remaining, 4)
+                # A stale cursor naming an unknown job must not lose the cycle.
+                set_monitor_cursor(db, "liepin", "lp-gone")
+                window, remaining = monitor._liepin_cycle_window(db, jobs, 3)
+                self.assertEqual([job["id"] for job in window], ["lp-0", "lp-1", "lp-2"])
+                self.assertEqual(remaining, 4)
+                # No cursor yet: start at the top.
+                set_monitor_cursor(db, "liepin", "")
+                window, remaining = monitor._liepin_cycle_window(db, jobs, 3)
+                self.assertEqual([job["id"] for job in window], ["lp-0", "lp-1", "lp-2"])
+                self.assertEqual(remaining, 4)
+            finally:
+                db.close()
+
+    def test_liepin_cursor_advances_past_jobs_without_replies(self):
+        """A silent job must not block the ones behind it from being checked."""
+        from allin.db import get_db, get_monitor_cursor, set_monitor_cursor
+        from allin.executor import monitor
+
+        jobs = [self._liepin_job(f"lp-{i}") for i in range(4)]
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "data" / "allin.db"
+
+            def open_db():
+                return get_db(db_path)
+
+            config = {"monitor": {"max_conversations_per_cycle": 2}}
+            with patch.object(monitor, "_check_liepin_job_reply", return_value=None), \
+                 patch.object(monitor, "get_db", side_effect=open_db), \
+                 patch.object(monitor, "close_tab"):
+                monitor._check_liepin_replies(config, jobs)
+                # Second cycle must move on rather than repeat the first two.
+                monitor._check_liepin_replies(config, jobs)
+
+            verify = open_db()
+            try:
+                self.assertEqual(get_monitor_cursor(verify, "liepin"), "lp-3")
+            finally:
+                verify.close()
+
+    def test_own_greeting_alone_is_not_reported_as_a_reply(self):
+        """A conversation whose newest message is our own greeting has no HR reply."""
+        from allin.executor import monitor
+
+        greeting = "您好，我看了岗位描述，我的相关经验比较匹配，方便聊聊吗？"
+        job = self._liepin_job(greeting=greeting)
+        messages = json.dumps([
+            {"sender": "system", "text": "求职过程中如遇收取费用请举报", "kind": "message"},
+            {"sender": "me", "text": greeting, "kind": "message"},
+        ])
+        with patch.object(monitor, "_open_monitor_tab", return_value="tab"), \
+             patch.object(monitor, "_wait_or_stop", return_value=False), \
+             patch.object(monitor, "_wait_for_page_or_stop", return_value=True), \
+             patch.object(monitor, "_inspect_monitor_page"), \
+             patch.object(monitor, "evaluate", side_effect=[
+                 json.dumps({"status": "ok", "history_readable": True}), messages,
+             ]), \
+             patch.object(monitor, "close_tab"):
+            result = monitor._check_liepin_job_reply(job, {"monitor": {}}, MagicMock())
+
+        self.assertIsNone(result)
+
+    def test_hr_message_after_our_greeting_is_reported(self):
+        """The receive branch (a body tile without the `send` marker) is HR's message."""
+        from allin.executor import monitor
+
+        greeting = "您好，我看了岗位描述，我的相关经验比较匹配，方便聊聊吗？"
+        job = self._liepin_job(greeting=greeting)
+        job["status"] = "sent"
+        hr_message = "方便发一份简历过来吗？"
+        messages = json.dumps([
+            {"sender": "me", "text": greeting, "kind": "message"},
+            {"sender": "hr", "text": hr_message, "kind": "message"},
+        ])
+        db = MagicMock()
+        db.execute.return_value.fetchone.return_value = None
+        with patch.object(monitor, "_open_monitor_tab", return_value="tab"), \
+             patch.object(monitor, "_wait_or_stop", return_value=False), \
+             patch.object(monitor, "_wait_for_page_or_stop", return_value=True), \
+             patch.object(monitor, "_inspect_monitor_page"), \
+             patch.object(monitor, "update_job_status") as update_status, \
+             patch.object(monitor, "add_history") as add_history_mock, \
+             patch.object(monitor, "evaluate", side_effect=[
+                 json.dumps({"status": "ok", "history_readable": True}), messages,
+             ]), \
+             patch.object(monitor, "close_tab"):
+            result = monitor._check_liepin_job_reply(job, {"monitor": {}}, db)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["conversation"]["last_message"], hr_message)
+        # The job must actually move out of `sent`.
+        update_status.assert_called_once_with(db, job["id"], "replied")
+        add_history_mock.assert_called_once()
+
+    def test_unreadable_history_is_skipped_instead_of_guessed(self):
+        """Liepin hides some history; guessing there could fake a reply."""
+        from allin.executor import monitor
+
+        job = self._liepin_job()
+        with patch.object(monitor, "_open_monitor_tab", return_value="tab"), \
+             patch.object(monitor, "_wait_or_stop", return_value=False), \
+             patch.object(monitor, "_wait_for_page_or_stop", return_value=True), \
+             patch.object(monitor, "_inspect_monitor_page"), \
+             patch.object(monitor, "evaluate", return_value=json.dumps(
+                 {"status": "ok", "history_readable": False}
+             )) as evaluate_mock, \
+             patch.object(monitor, "close_tab"):
+            result = monitor._check_liepin_job_reply(job, {"monitor": {}}, MagicMock())
+
+        self.assertIsNone(result)
+        # Must not even attempt to read messages from a hidden history.
+        self.assertEqual(evaluate_mock.call_count, 1)
 
 
 if __name__ == "__main__":

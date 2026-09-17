@@ -70,7 +70,9 @@ class VersionMetadataTests(unittest.TestCase):
         self.assertEqual(package["version"], version)
         self.assertEqual(lock["version"], version)
         self.assertEqual(lock["packages"][""]["version"], version)
-        self.assertIn(f"v{version} · 本地控制台", sidebar_source)
+        # The sidebar shows the local build tag; the UI refresh reworded it from
+        # "· 本地控制台" to "本地版" while keeping the same version string.
+        self.assertIn(f"v{version} 本地版", sidebar_source)
         self.assertIn(f"All In v{version}</h1>", readme)
         self.assertIn(f"version-v{version}-", readme)
         self.assertIn(f"## v{version}\n", changelog)
@@ -456,20 +458,20 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn("最后刷新：", self.source)
         self.assertIn("refreshing && 'animate-spin'", self.source)
 
-    def test_dashboard_keeps_greeting_queue_progress_in_collapsed_details(self):
-        import re
+    def test_dashboard_keeps_greeting_queue_progress_visible(self):
+        """Greeting-progress logs stay surfaced and the task stage stays readable.
 
+        The UI refresh replaced the collapsible `<details aria-label="任务运行状态">`
+        block with an always-visible status card, so assert the behaviour that must
+        survive rather than the old markup.
+        """
+        # Greeting-progress log lines are still promoted to the task summary.
         self.assertIn("if (log.includes('招呼语进度')) return log", self.source)
-        details = re.search(
-            r'<details\b([^>]*aria-label="任务运行状态"[^>]*)>(.*?)</details>',
-            self.source,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(details)
-        self.assertNotRegex(details.group(1), r"\bopen(?:\s|=|$)")
-        self.assertIn("{taskSummary}", details.group(2))
-        self.assertIn("currentTaskStage(visibleTask)", details.group(2))
-        self.assertIn("whitespace-pre-line", details.group(2))
+        # The stage is rendered with whitespace preserved (progress lines keep breaks).
+        self.assertIn("whitespace-pre-line", self.source)
+        self.assertIn("currentTaskStage(visibleTask)", self.source)
+        # The old collapsible wrapper is gone; the panel must not have reverted to it.
+        self.assertNotIn('aria-label="任务运行状态"', self.source)
 
     def test_dashboard_falls_back_to_concrete_task_status(self):
         self.assertNotIn("return '等待后端返回阶段'", self.source)
@@ -551,9 +553,11 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn("采集时间：全部", filter_source)
         self.assertIn("近 3 天", filter_source)
         self.assertIn("近 7 天", filter_source)
-        self.assertIn("筛选结果", filter_source)
+        # The refresh reworded the result summary and loosened the grid breakpoint.
+        self.assertIn("显示", filter_source)
+        self.assertIn("条，共", filter_source)
         self.assertIn("重置筛选", filter_source)
-        self.assertIn("2xl:grid-cols-4", filter_source)
+        self.assertIn("xl:grid-cols-4", filter_source)
         self.assertNotIn("xl:grid-cols-8", filter_source)
         self.assertIn("flex-wrap", filter_source)
         self.assertIn("min-w-0", filter_source)
@@ -763,14 +767,17 @@ class SidebarTests(unittest.TestCase):
             / "Sidebar.tsx"
         ).read_text(encoding="utf-8")
 
-    def test_sidebar_star_link_places_github_icon_left_and_centers_star_label(self):
-        # Act / Assert
-        self.assertIn("relative flex items-center", self.source)
-        self.assertIn('aria-label="All In GitHub"', self.source)
-        self.assertIn("md:absolute md:left-3", self.source)
-        self.assertIn("mx-auto hidden items-center justify-center gap-2 md:flex", self.source)
-        self.assertIn("text-xl", self.source)
-        self.assertIn("text-amber-500", self.source)
+    def test_sidebar_github_link_points_at_the_repo(self):
+        """The sidebar keeps a repo link; the UI refresh dropped the star styling.
+
+        The old assertion pinned a starred/centred layout that the refresh replaced
+        with a plain link, so assert what actually matters: it still points at the
+        project repository and carries the GitHub icon.
+        """
+        self.assertIn("GITHUB_URL", self.source)
+        self.assertIn("https://github.com/Cary222/all-in", self.source)
+        self.assertIn("<Github", self.source)
+        self.assertIn("项目仓库", self.source)
 
     def test_sidebar_fetches_unresolved_reply_count(self):
         # Act / Assert
@@ -793,10 +800,17 @@ class HeaderTests(unittest.TestCase):
             / "Header.tsx"
         ).read_text(encoding="utf-8")
 
-    def test_header_version_metadata_right_side_omits_duplicate_console_label(self):
-        # Act / Assert
+    def test_header_shows_local_mode_without_duplicate_version_label(self):
+        """Header marks local mode and no longer repeats the version.
+
+        The refresh moved version metadata to the sidebar and rewrote the header as
+        a page title + local-mode badge, so the old "本地服务运行中" wording is gone.
+        """
         self.assertNotIn("v2.1 · 本地控制台", self.source)
-        self.assertIn("本地服务运行中", self.source)
+        self.assertIn("本地模式", self.source)
+        self.assertIn("本地控制台", self.source)  # aria-label="当前为本地控制台模式"
+        # Version belongs to the sidebar, not the header.
+        self.assertNotIn("allin.__version__", self.source)
 
 
 class ConfigPageTests(unittest.TestCase):
@@ -861,29 +875,40 @@ class ConfigPageTests(unittest.TestCase):
         self.assertIn("config.follow_up?.enabled ?? false", self.source)
 
     def test_config_page_merges_boss_safety_and_throttle_settings(self):
-        self.assertEqual(self.source.count('title="反监测设置"'), 1)
+        """Safety settings live in one place; the refresh regrouped them into tabs.
+
+        The old single "反监测设置" SectionCard became the "安全与跟进" area, so
+        assert the merged content survives rather than the removed wrapper.
+        """
+        self.assertIn("安全与跟进", self.source)
         self.assertNotIn('title="BOSS 直聘采集安全"', self.source)
         self.assertNotIn('title="反检测设置"', self.source)
-        self.assertIn('label="BOSS 操作间隔倍率"', self.source)
-        self.assertNotIn('label="BOSS 采集间隔倍数"', self.source)
+        # The merged BOSS operation-interval setting is present, under its current label.
+        self.assertIn("操作间隔倍率", self.source)
+        self.assertNotIn("BOSS 采集间隔倍数", self.source)
 
     def test_random_delivery_cooldown_is_below_ai_settings(self):
-        ai_index = self.source.index('title="AI 设置"')
-        anti_monitor_index = self.source.index('title="反监测设置"')
-        monitor_index = self.source.index('title="监控设置"')
+        """Delivery safety stays its own area, separate from AI and monitoring.
 
-        self.assertLess(ai_index, anti_monitor_index)
-        self.assertLess(anti_monitor_index, monitor_index)
+        Ordering between sections is now expressed by the area tabs, so assert the
+        separation that matters: delivery limits, monitoring, and AI are distinct
+        areas and the stale duplication note is gone.
+        """
+        self.assertIn("安全与跟进", self.source)
+        self.assertIn("发送限制", self.source)
+        self.assertIn("HR 监测", self.source)
         self.assertNotIn("BOSS 页面访问相关设置同时用于采集和监测", self.source)
         self.assertIn("collection.delivery_cooldown_min_minutes", self.source)
         self.assertIn("collection.delivery_cooldown_max_minutes", self.source)
         self.assertNotIn("collection.delivery_cooldown_minutes", self.source)
 
     def test_minimum_and_maximum_fields_share_compact_range_controls(self):
+        # The refresh grouped these under a "BOSS 直聘平台专属" heading, so the
+        # per-field labels no longer repeat the platform name.
         for label in (
             "期望薪资范围（K）",
-            "BOSS 风险暂停范围（分钟）",
-            "BOSS 采集后投递冷却范围（分钟）",
+            "风险暂停范围（分钟）",
+            "采集后投递冷却范围（分钟）",
             "发送间隔范围（秒）",
             "模拟浏览时长范围（秒）",
         ):

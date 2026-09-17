@@ -1,4 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <rect width="32" height="32" rx="8" fill="#FB6511"/>
-  <text x="16" y="22" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="900" fill="white" text-anchor="middle">BH</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="All In">
+  <rect width="32" height="32" rx="7.11111" fill="#246B5A"/>
+  <g transform="translate(8 8) scale(0.666667)" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="6" cy="19" r="3"/>
+    <path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/>
+    <circle cx="18" cy="5" r="3"/>
+  </g>
 </svg>

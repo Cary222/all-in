@@ -171,6 +171,15 @@ def _init_tables(conn: sqlite3.Connection) -> None:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- Resume point for platforms that can only inspect one conversation per job
+        -- page visit (Liepin). Kept out of `history` on purpose: that table feeds the
+        -- user-facing daily-activity chart, so per-job cursors would pollute it.
+        CREATE TABLE IF NOT EXISTS monitor_cursors (
+            platform TEXT PRIMARY KEY,
+            last_job_id TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
         CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score);
         CREATE INDEX IF NOT EXISTS idx_history_job_id ON history(job_id);
@@ -189,6 +198,7 @@ def _init_tables(conn: sqlite3.Connection) -> None:
     _migrate_platform_safety_state(conn)
     _init_scoring_runs(conn)
     _init_collection_runs(conn)
+    _migrate_collection_run_jobs(conn)
     _init_collect_progress(conn)
     _init_score_traces(conn)
 
@@ -1213,11 +1223,47 @@ def _init_collection_runs(conn: sqlite3.Connection) -> None:
             finished_at TIMESTAMP NULL
         );
         CREATE INDEX IF NOT EXISTS idx_collection_runs_status ON collection_runs(status);
+        -- Collected job ids live in their own table so appending one job is a single
+        -- row insert. Keeping them in the run's JSON column meant every saved job
+        -- rewrote the whole growing list (quadratic for large collections), and
+        -- batching those writes instead would have made a crash lose already-saved
+        -- jobs. The run table keeps its JSON column for back-compat reads.
+        CREATE TABLE IF NOT EXISTS collection_run_jobs (
+            run_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            PRIMARY KEY (run_id, job_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_collection_run_jobs_position ON collection_run_jobs(run_id, position);
         """
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(collection_runs)")}
     if "boss_checkpoint_json" not in columns:
         conn.execute("ALTER TABLE collection_runs ADD COLUMN boss_checkpoint_json TEXT NOT NULL DEFAULT '{}'")
+    conn.commit()
+
+
+def _migrate_collection_run_jobs(conn: sqlite3.Connection) -> None:
+    """Backfill legacy collected ids into the child table exactly once.
+
+    Runs are read from ``collection_run_jobs`` now, so ids written before that table
+    existed must be copied over or a resumable run would appear to have collected
+    nothing. The ``PRAGMA user_version`` guard matters: ``get_db`` initialises the
+    schema on every connection, and an unguarded full scan here would make each
+    per-job append pay for a scan of all runs.
+    """
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
+        return
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO collection_run_jobs (run_id, job_id, position)
+        SELECT r.id, value, key - 1
+        FROM collection_runs r, json_each(r.collected_job_ids_json)
+        WHERE r.collected_job_ids_json NOT IN ('', '[]')
+          AND NOT EXISTS (SELECT 1 FROM collection_run_jobs j WHERE j.run_id = r.id)
+        """
+    )
+    conn.execute("PRAGMA user_version = 1")
     conn.commit()
 
 
@@ -1345,6 +1391,36 @@ def set_platform_safety_lock(
     )
     conn.commit()
     return {"platform": platform_key, "reason": reason, "locked_until": locked_until.isoformat()}
+
+
+def get_monitor_cursor(conn: sqlite3.Connection, platform: str) -> str:
+    """Return the last job id a cursor-based platform checked, or '' when unset.
+
+    Platforms without a message centre (Liepin) can only inspect one conversation
+    per job-page visit, so they must remember where the previous cycle stopped.
+    Without this the cycle always re-checked the same first few jobs and the rest
+    were never visited.
+    """
+    row = conn.execute(
+        "SELECT last_job_id FROM monitor_cursors WHERE platform = ?",
+        (normalize_platform_name(platform),),
+    ).fetchone()
+    return str(row["last_job_id"] or "") if row else ""
+
+
+def set_monitor_cursor(conn: sqlite3.Connection, platform: str, last_job_id: str) -> None:
+    """Persist the cursor so the next cycle resumes after this job."""
+    conn.execute(
+        """
+        INSERT INTO monitor_cursors (platform, last_job_id, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(platform) DO UPDATE SET
+            last_job_id = excluded.last_job_id,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (normalize_platform_name(platform), str(last_job_id or "")),
+    )
+    conn.commit()
 
 
 def get_active_platform_safety_lock(

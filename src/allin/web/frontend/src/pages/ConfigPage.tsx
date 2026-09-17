@@ -9,7 +9,7 @@ import { CityMultiSelect, type CityOption } from '@/components/config/CityMultiS
 import { ResumeUploadSection } from '@/components/config/ResumeUploadSection'
 import { Save, RotateCcw, Loader2, Lock, Unlock, RefreshCw, AlertTriangle, CheckCircle2, Clock } from 'lucide-react'
 import { useState, useEffect, useRef } from 'react'
-import { PLATFORM_LABELS, PLATFORM_SHORT_LABELS } from '@/lib/platforms'
+import { PLATFORM_LABELS, PLATFORM_SHORT_LABELS, platformSupportsReplyMonitoring } from '@/lib/platforms'
 
 const AI_SERVICES = {
   anthropic: {
@@ -450,7 +450,7 @@ export default function ConfigPage() {
         {activeArea === 'sources' && <SectionCard title="平台与采集设置">
           <div className="space-y-4">
             <p className="text-xs leading-5 text-muted">
-              BOSS 直聘与智联招聘支持自动投递；前程无忧和猎聘负责采集与评分，投递后可在岗位池手动标记。
+              四个平台均支持采集、评分与招呼语生成。BOSS 直聘与猎聘支持人工确认后自动投递；智联招聘在投递时按匹配简历投递；前程无忧由于网页端没有聊天窗口，HR 沟通在微信侧进行。
             </p>
             <div className="hidden grid-cols-4 rounded-lg border border-card-border bg-muted-surface p-1 sm:grid" role="tablist" aria-label="招聘平台">
               {(['boss', 'zhilian', '51job', 'liepin'] as PlatformId[]).map(item => (
@@ -892,6 +892,21 @@ export default function ConfigPage() {
 
         {activeSafetyArea === 'monitor' && <SectionCard title="HR 监测">
           <div className="space-y-4">
+            <div className="rounded-[10px] border border-card-border bg-muted-surface p-4">
+              <p className="text-xs font-semibold text-foreground">网页端可监测回复的平台</p>
+              <p className="mt-1 text-xs text-muted">
+                猎聘没有独立消息中心，监测会逐个打开已打招呼的岗位页读取聊天弹窗，因此受「每轮最多处理对话数」限制。
+              </p>
+              {(Object.keys(PLATFORM_LABELS) as PlatformId[]).filter(platform => !platformSupportsReplyMonitoring(platform)).map(platform => (
+                <p key={platform} className="mt-2 flex items-start gap-1.5 text-xs text-amber-700">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    <span className="font-semibold">{PLATFORM_LABELS[platform]}</span>
+                    ：网页端没有聊天窗口，HR 回复只能在微信服务号或 APP 中查看，无法自动监测；该平台的岗位仍可采集、评分与投递。
+                  </span>
+                </p>
+              ))}
+            </div>
             <Field label="检查间隔 (分钟)">
               <Input type="number" value={config.monitor?.interval || 30} onChange={e => updateConfig('monitor.interval', Number(e.target.value))} min={1} max={120} />
               <p className="mt-1 text-xs text-muted">单独监测会立即检查一次；后续轮询还会乘以 BOSS 操作间隔倍率。</p>

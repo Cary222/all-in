@@ -1,6 +1,7 @@
 """AI Scorer - Match jobs against resume using Claude API."""
 
 import json
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -690,6 +691,13 @@ def _report_checkpoint(
 ) -> None:
     callback = config.get("_workbench_score_checkpoint")
     if callable(callback):
+        # Remember the newest state so a throttled flush can still report the truth.
+        config["_score_checkpoint_pending"] = {
+            "remaining_job_ids": list(remaining_job_ids),
+            "status": status,
+            "pause_reason": pause_reason,
+            "error": error or "",
+        }
         callback({
             "remaining_job_ids": list(remaining_job_ids),
             "status": status,
@@ -697,6 +705,35 @@ def _report_checkpoint(
             # 只有 AI 失败导致的暂停才带 error；用户手动暂停不应记为错误（issue #100）。
             "error": error or "",
         })
+
+
+def _report_checkpoint_throttled(
+    config: dict,
+    remaining_job_ids: list[str],
+    *,
+    status: str = "running",
+    min_interval: float = 5.0,
+    min_progress: int = 25,
+) -> None:
+    """Report progress at most every ``min_interval`` seconds / ``min_progress`` jobs.
+
+    The checkpoint callback serialises the whole remaining-id list and commits a
+    transaction, so reporting on every single job made a large run quadratic (1001
+    jobs meant ~1001 full-list writes). Progress is still reported, just bounded;
+    callers must flush with the exact ``_report_checkpoint`` on any terminal state.
+    """
+    state = config.get("_score_checkpoint_throttle")
+    now = time.monotonic()
+    if isinstance(state, dict):
+        last_time = float(state.get("last_time") or 0.0)
+        last_remaining = int(state.get("last_remaining", remaining_job_ids.__len__()))
+        if (now - last_time) < min_interval and abs(last_remaining - len(remaining_job_ids)) < min_progress:
+            return
+    config["_score_checkpoint_throttle"] = {
+        "last_time": now,
+        "last_remaining": len(remaining_job_ids),
+    }
+    _report_checkpoint(config, remaining_job_ids, status=status)
 
 
 def _record_score_failure(db, job: dict, detail: str) -> None:
@@ -890,7 +927,10 @@ def score_jobs(
         def mark_completed(job_id: str) -> None:
             if job_id in remaining_job_ids:
                 remaining_job_ids.remove(job_id)
-            _report_checkpoint(config, remaining_job_ids, status="running")
+            # Throttled: a per-job checkpoint rewrote the whole remaining-id list and
+            # committed each time, making big runs quadratic. Terminal states below
+            # still flush the exact list.
+            _report_checkpoint_throttled(config, remaining_job_ids)
 
         ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
         try:
@@ -1078,6 +1118,10 @@ def score_jobs(
             )
         if failed:
             _notify(config, f"本轮有 {failed} 个岗位评分失败并保留为待处理，可稍后重试。")
+        # No extra flush needed: both terminal branches below already carry the
+        # authoritative remaining-id list (the exact list when paused, [] when the
+        # run finished), so the throttled running-report cannot leave a stale list
+        # behind on a terminal run.
         if remaining_job_ids:
             _report_checkpoint(
                 config,

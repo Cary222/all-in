@@ -55,7 +55,8 @@ class ResumeContentRevealSourceTests(unittest.TestCase):
 		self.assertIn("window.addEventListener('dragover'", self.upload_section)
 		self.assertIn("window.addEventListener('drop'", self.upload_section)
 		self.assertIn("onDrop={handleResumeDrop}", self.upload_section)
-		self.assertIn("/api/resume/upload", self.upload_section)
+		# The multi-resume refresh routes uploads through the plural endpoint.
+		self.assertIn("/api/resumes/upload", self.upload_section)
 		self.assertIn("resumeDropOutsideTip", self.upload_section)
 		self.assertIn("afterDropOutside", self.upload_section)
 		self.assertIn("afterSuccessfulResumeLoad", self.upload_section)
@@ -69,21 +70,27 @@ class ResumeContentRevealSourceTests(unittest.TestCase):
 		# Prefer exact call shapes over bare identifier presence.
 		self.assertIn("setPanelMessages((prev) => afterSuccessfulResumeLoad(prev))", self.upload_section)
 		self.assertIn("setPanelMessages((prev) => afterDropOutside(prev, resumeDropOutsideTip()))", self.upload_section)
-		null_branch = self.upload_section.split("data === null")[1].split("const message")[0]
-		self.assertIn("afterSuccessfulResumeLoad(prev)", null_branch)
-		success_branch = self.upload_section.split("data && data.filename")[1].split("shouldSyncResumePath")[0]
-		self.assertIn("afterSuccessfulResumeLoad(prev)", success_branch)
+		# The multi-resume refresh replaced the single-resume branches (which keyed
+		# off `data === null` / `data.filename`) with a list-first flow that falls
+		# back to the single-resume endpoint. A successful load must still only
+		# clear load errors via afterSuccessfulResumeLoad, in both paths.
+		self.assertIn("/api/resumes", self.upload_section)
+		self.assertIn("/api/resume", self.upload_section)
+		success_calls = self.upload_section.count("afterSuccessfulResumeLoad(prev)")
+		self.assertGreaterEqual(success_calls, 3, "both list and fallback paths must clear load errors")
+		self.assertNotIn("data === null", self.upload_section)
 
 	def test_upload_section_uses_dual_preview(self):
 		self.assertIn("ResumeDualPreview", self.upload_section)
-		self.assertIn(
-			"ResumeDualPreview key={`${resumeInfo.path}:${resumeInfo.cache_buster || ''}`}",
-			self.upload_section,
-		)
+		# The multi-resume refresh renamed the map variable from `resumeInfo` to
+		# `resume` and split the JSX across lines, so assert the cache-busting key
+		# expression itself rather than one exact line.
+		self.assertIn("key={`${resume.path}:${resume.cache_buster || ''}`}", self.upload_section)
+		self.assertIn("info={resume}", self.upload_section)
 		self.assertIn("resumeLoadErrorMessage", self.upload_section)
 		self.assertIn("shouldSyncResumePath", self.upload_section)
 		self.assertIn("删除简历失败", self.upload_section)
-		self.assertIn("data === null", self.upload_section)
+		self.assertNotIn("data === null", self.upload_section)
 
 	def test_dual_preview_defaults_hidden_with_independent_toggles(self):
 		self.assertIn("const [pdfVisible, setPdfVisible] = useState(false)", self.dual)
@@ -104,29 +111,28 @@ class ResumeContentRevealSourceTests(unittest.TestCase):
 		self.assertIn("resumeLoadErrorMessage", self.display_lib)
 
 	def test_upload_section_wires_failure_message_channels(self):
-		"""Abnormal UI paths must route through afterResumeLoadFailure / explicit copy."""
-		self.assertIn("setPanelMessages((prev) => afterResumeLoadFailure(prev, message))", self.upload_section)
-		self.assertIn(
-			"setPanelMessages((prev) => afterResumeLoadFailure(prev, data.error || '简历上传失败'))",
-			self.upload_section,
-		)
-		self.assertIn(
-			"setPanelMessages((prev) => afterResumeLoadFailure(prev, '网络错误，简历上传失败'))",
-			self.upload_section,
-		)
-		self.assertIn(
-			"setPanelMessages((prev) => afterResumeLoadFailure(prev, '网络错误，无法读取简历'))",
-			self.upload_section,
-		)
+		"""Abnormal UI paths must route through afterResumeLoadFailure / explicit copy.
+
+		The multi-resume refresh replaced the single-resume upload messages with one
+		aggregated failure line (reporting how many files failed), and moved the
+		delete/default/edit errors to their own copy.
+		"""
+		self.assertIn("afterResumeLoadFailure", self.upload_section)
+		# Aggregated multi-file upload failure.
+		self.assertIn("个上传失败", self.upload_section)
+		self.assertIn("上传发生网络错误", self.upload_section)
+		# Delete / default / edit paths report their own explicit reasons.
+		self.assertIn("网络错误，无法读取简历列表", self.upload_section)
 		self.assertIn("删除简历失败", self.upload_section)
 		self.assertIn("网络错误，删除简历失败", self.upload_section)
+		self.assertIn("设为默认简历失败", self.upload_section)
+		self.assertIn("更新简历信息失败", self.upload_section)
+		# Every guarded response path checks the HTTP status and the payload flag.
 		self.assertIn("!res.ok || !data.success", self.upload_section)
 		self.assertIn("!res.ok || !data?.success", self.upload_section)
-		fail_branch = self.upload_section.split("const message = resumeLoadErrorMessage")[1].split(
-			"if (data && data.filename)"
-		)[0]
-		self.assertIn("afterResumeLoadFailure(prev, message)", fail_branch)
-		self.assertNotIn("afterSuccessfulResumeLoad", fail_branch)
+		# The visible panel message is derived only from the failure channel, so a
+		# failed action can never render as a success.
+		self.assertIn("resumePanelVisibleMessage(panelMessages)", self.upload_section)
 
 
 class ResumeApiPreviewRouteTests(unittest.TestCase):

@@ -354,13 +354,16 @@ class WorkbenchTaskRunner:
                 task.updated_at = datetime.now().isoformat(timespec="seconds")
                 self._slots.pop(task.slot or "", None)
         except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            task.logs.append(f"任务异常失败：{exc}\n{tb}")
             with self._lock:
                 if task.stop_requested.is_set():
                     task.status = "stopped"
                     task.error = None
                 else:
                     task.status = "failed"
-                    task.error = str(exc)
+                    task.error = f"{exc}\n\n{tb}"
                 task.updated_at = datetime.now().isoformat(timespec="seconds")
                 self._slots.pop(task.slot or "", None)
         finally:

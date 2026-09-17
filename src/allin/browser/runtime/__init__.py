@@ -243,7 +243,10 @@ def start_runtime(config: dict[str, Any] | None = None, node_executable: str = "
         "stdin": subprocess.DEVNULL,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        # Avoid combining DETACHED_PROCESS with standard handles (DEVNULL),
+        # which triggers Windows ERROR_INVALID_PARAMETER (Errno 22 Invalid argument).
+        no_window_flag = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | no_window_flag
     else:
         kwargs["start_new_session"] = True
     _runtime_process = subprocess.Popen([node_executable, str(script_path)], **kwargs)
@@ -279,7 +282,10 @@ def ensure_runtime(config: dict[str, Any] | None = None, wait_seconds: float = 1
             return False
         _switch_runtime_port(config, browser, fallback_port)
 
-    start_runtime(browser, str(node.get("executable") or "node"))
+    try:
+        start_runtime(browser, str(node.get("executable") or "node"))
+    except (OSError, subprocess.SubprocessError):
+        return False
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
         if runtime_targets(browser) is not None:
